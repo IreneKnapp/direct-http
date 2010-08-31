@@ -160,6 +160,7 @@ import qualified System.IO.Error as System
 -- | An opaque type representing the state of the HTTP server during a single
 --   connection from a client.
 data HTTPState = HTTPState {
+    httpStateLogMVar :: MVar (),
     httpStateSocket :: Network.Socket,
     httpStatePeer :: Network.SockAddr
   }
@@ -271,9 +272,10 @@ acceptLoop
     -- ^ Never actually returns.
 acceptLoop fork handler = do
   listenSocket <- createListenSocket
+  logMVar <- newMVar ()
   let acceptLoop' = do
         (socket, peer) <- Network.accept listenSocket
-        requestLoop socket peer fork handler
+        requestLoop logMVar socket peer fork handler
         acceptLoop'
   acceptLoop'
 
@@ -288,12 +290,13 @@ createListenSocket = do
   return listenSocket
 
 
-requestLoop :: Network.Socket
+requestLoop :: MVar ()
+            -> Network.Socket
             -> Network.SockAddr
             -> (IO () -> IO ThreadId)
-            -> (HTTP ())
+            -> HTTP ()
             -> IO ()
-requestLoop socket peer fork handler = do
+requestLoop logMVar socket peer fork handler = do
   maybeHeaders <- recvHeaders socket
   case maybeHeaders of
     Nothing -> do
@@ -304,6 +307,7 @@ requestLoop socket peer fork handler = do
       return ()
     Just headers -> do
       let state = HTTPState {
+                      httpStateLogMVar = logMVar,
                       httpStateSocket = socket,
                       httpStatePeer = peer
                     }
@@ -315,7 +319,7 @@ requestLoop socket peer fork handler = do
                       ++ (show (error :: Exception.SomeException))
             httpCloseOutput)
         return ()
-      requestLoop socket peer fork handler
+      requestLoop logMVar socket peer fork handler
 
 
 parseCookies :: String -> [Cookie]
@@ -452,8 +456,8 @@ recvHeaders socket = do
 -- | Logs a message using the web server's logging facility.
 httpLog :: (MonadHTTP m) => String -> m ()
 httpLog message = do
-  liftIO $ putStrLn message
-  -- TODO
+  HTTPState { httpStateLogMVar = logMVar } <- getHTTPState
+  liftIO $ withMVar logMVar (\() -> putStrLn message)
 
 
 -- | Headers are classified by HTTP/1.1 as request headers, response headers, or
