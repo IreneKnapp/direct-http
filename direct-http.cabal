@@ -1,0 +1,28 @@
+name: direct-http
+version: 1.0
+cabal-version: >= 1.2
+build-type: Simple
+license: BSD3
+license-file: LICENSE
+copyright: Copyright (c) 2009 Dan Knapp
+author: Dan Knapp
+maintainer: dankna@gmail.com
+homepage: http://dankna.com/software/
+bug-reports: http://dankna.com/issues/create/
+category: Network
+synopsis: Native webserver that acts as a library.
+description:
+  This package is a native implementation of the HTTP and HTTPS protocols.  It
+  lives as a library, exporting an interface reminiscent of CGI or FastCGI.
+  Thus policy on how namespace is mapped to files and/or scripts is entirely up
+  to the client application.
+
+Library
+  exposed-modules: Network.HTTP
+  build-depends: base >= 4.1 && < 5,
+                 bytestring >= 0.9.1.4 && < 1,
+                 containers >= 0.3.0.0 && < 1,
+                 mtl >= 1.1.0.2 && < 2,
+                 network >= 2.2.1.5 && < 3,
+                 network-bytestring >= 0.1.2.1 && < 1,
+                 utf8-string >= 0.3.6 && < 1
