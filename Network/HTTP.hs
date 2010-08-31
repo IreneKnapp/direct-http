@@ -377,11 +377,6 @@ requestLoop accessLogMaybeHandleMVar
   maybeRequestInfo <- runReaderT recvHeaders state
   case maybeRequestInfo of
     Nothing -> do
-      peerString <- case peer of
-                      Network.SockAddrInet _ address
-                        -> liftIO $ Network.inet_ntoa address
-      flip runReaderT state $ httpLog $ "Invalid request from " ++ peerString
-                              ++ "; closing its connection."
       liftIO $ Exception.catch (Network.sClose socket)
                                (\error -> do
                                   return $ error :: IO Exception.IOException
@@ -413,10 +408,14 @@ requestLoop accessLogMaybeHandleMVar
 
 logAccess :: HTTP ()
 logAccess = do
-  HTTPState { httpStatePeer = peer } <- getHTTPState
-  peerString <- case peer of
-                  Network.SockAddrInet _ address
-                    -> liftIO $ Network.inet_ntoa address
+  maybePeerString <- getRemoteHost
+  peerString <- case maybePeerString of
+                  Nothing -> do
+                    HTTPState { httpStatePeer = peer } <- getHTTPState
+                    case peer of
+                      Network.SockAddrInet _ address
+                        -> liftIO $ Network.inet_ntoa address
+                  Just peerString -> return peerString
   identString <- return "-"
   usernameString <- return "-"
   timestampString <- return "10/Oct/2000:13:55:36 -0700"
@@ -584,8 +583,7 @@ recvHeaders = do
   HTTPState { httpStateInputBufferMVar = inputBufferMVar } <- getHTTPState
   inputBuffer <- liftIO $ takeMVar inputBufferMVar
   (inputBuffer, maybeLine) <- recvLine inputBuffer
-  liftIO $ putMVar inputBufferMVar inputBuffer
-  case maybeLine of
+  result <- case maybeLine of
     Nothing -> return Nothing
     Just line -> do
       let computeWords input =
@@ -601,7 +599,15 @@ recvHeaders = do
             && (isValidURL url)
             && (isValidProtocol protocol)
           -> return $ Just (method, url, protocol, Map.empty)
-        _ -> return Nothing
+        _ -> do
+          HTTPState { httpStatePeer = Network.SockAddrInet _ address }
+            <- getHTTPState
+          peerString <- liftIO $ Network.inet_ntoa address
+          httpLog $ "Invalid request from " ++ peerString
+                    ++ "; closing its connection."
+          return Nothing
+  liftIO $ putMVar inputBufferMVar inputBuffer
+  return result
 
 
 isValidMethod :: ByteString -> Bool
