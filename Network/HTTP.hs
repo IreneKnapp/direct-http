@@ -11,6 +11,7 @@ module Network.HTTP (
              implementationUnblockHTTP,
              
              -- * Accepting requests
+             HTTPServerParameters(..),
              acceptLoop,
              
              -- * Logging
@@ -151,6 +152,7 @@ import qualified Network.Socket as Network hiding (send, sendTo, recv, recvFrom)
 import qualified Network.Socket.ByteString as Network
 import Prelude hiding (catch)
 import System.Environment
+import System.IO
 import System.IO.Error (ioeGetErrorType)
 import qualified System.IO.Error as System
 
@@ -158,11 +160,16 @@ import qualified System.IO.Error as System
 -- | An opaque type representing the state of the HTTP server during a single
 --   connection from a client.
 data HTTPState = HTTPState {
-    httpStateAccessLogMVar :: MVar (),
-    httpStateErrorLogMVar :: MVar (),
+    httpStateAccessLogMaybeHandleMVar :: MVar (Maybe Handle),
+    httpStateErrorLogMaybeHandleMVar :: MVar (Maybe Handle),
     httpStateSocket :: Network.Socket,
     httpStatePeer :: Network.SockAddr,
-    httpStateInputBufferMVar :: MVar ByteString
+    httpStateInputBufferMVar :: MVar ByteString,
+    httpStateQueryString :: MVar (Maybe String),
+    httpStateRemoteHostname :: MVar (Maybe (Maybe String)),
+    httpStateRequestMethod :: MVar String,
+    httpStateRequestURI :: MVar String,
+    httpStateRequestProtocol :: MVar String
   }
 
 
@@ -237,12 +244,38 @@ instance MonadHTTP HTTP where
       liftIO $ Exception.unblock (runReaderT action state)
 
 
+-- | A record used to configure the server.  Contains optional paths to files
+--   for the access and error logs (if these are omitted, logging is not done),
+--   and a flag indicating whether to run as a daemon.  Also contains the names
+--   field, which is a list containing one entry for each distinct server; each
+--   server entry consists of a list of names to recognize, the first such name
+--   being the canonical one, and a list of addresses and ports to bind to, with
+--   a flag for each indicating whether the binding should use the secure
+--   version of the protocol.
+data HTTPServerParameters = HTTPServerParameters {
+    serverParametersAccessLogPath :: Maybe FilePath,
+    serverParametersErrorLogPath :: Maybe FilePath,
+    serverParametersDaemonize :: Bool,
+    serverParametersNames :: [([Network.HostName],
+                               [(Network.HostAddress,
+                                 Network.PortNumber,
+                                 Bool)])]
+  }
+
+
 -- | Takes a forking primitive, such as 'forkIO' or 'forkOS', and a handler, and
 --   concurrently accepts requests from the web server, forking with the primitive
 --   and invoking the handler in the forked thread inside the 'HTTP' monad for each
 --   one.
 --   
---   If the daemonize flag is True, first closes the standard IO streams and moves
+--   If the access logfile path is not Nothing, opens this logfile in append mode
+--   and uses it to log all accesses; otherwise, access is not logged.
+--   
+--   If the error logfile path is not Nothing, opens this logfile in append mode
+--   and uses it to log all errors; otherwise, if not daemonizing, errors are logged
+--   to standard output; if daemonizing, errors are not logged.
+--   
+--   If the daemonize flag is True, closes the standard IO streams and moves
 --   the process into the background, doing all the usual Unix things to make it run
 --   as a daemon henceforth.  This is optional because it might be useful to turn it
 --   off for debugging purposes.
@@ -258,32 +291,41 @@ instance MonadHTTP HTTP where
 --   Any exceptions not caught within the handler are caught by 'concurrentAcceptLoop',
 --   and cause the termination of that handler, but not of the accept loop.
 acceptLoop
-    :: Bool
-    -- ^ A flag which indicates whether to daemonize.
+    :: HTTPServerParameters
+    -- ^ Parameters describing the behavior of the server to run.
     -> (IO () -> IO ThreadId)
     -- ^ A forking primitive, typically either 'forkIO' or 'forkOS'.
     -> (HTTP ())
     -- ^ A handler which is invoked once for each incoming connection.
     -> IO ()
     -- ^ Never actually returns.
-acceptLoop shouldDaemonize fork handler = do
+acceptLoop parameters fork handler = do
   listenSocket <- createListenSocket
-  if shouldDaemonize
-    then do
-      daemonize
+  accessLogMaybeHandle <- case serverParametersAccessLogPath parameters of
+                            Nothing -> return Nothing
+                            Just path -> openBinaryFile path AppendMode
+                                         >>= return . Just
+  accessLogMaybeHandleMVar <- newMVar accessLogMaybeHandle
+  errorLogMaybeHandle <- case serverParametersErrorLogPath parameters of
+                           Nothing -> if serverParametersDaemonize parameters
+                                        then return Nothing
+                                        else return $ Just stdout
+                           Just path -> openBinaryFile path AppendMode
+                                        >>= return . Just
+  errorLogMaybeHandleMVar <- newMVar errorLogMaybeHandle
+  if serverParametersDaemonize parameters
+    then daemonize
     else return ()
-  accessLogMVar <- newMVar ()
-  errorLogMVar <- newMVar ()
   let acceptLoop' = do
         (socket, peer) <- Network.accept listenSocket
-        requestLoop accessLogMVar errorLogMVar socket peer fork handler
+        requestLoop accessLogMaybeHandleMVar
+                    errorLogMaybeHandleMVar
+                    socket
+                    peer
+                    fork
+                    handler
         acceptLoop'
   acceptLoop'
-
-
-daemonize :: IO ()
-daemonize = do
-  putStrLn $ "Pretend-daemonizing."
 
 
 createListenSocket :: IO Network.Socket
@@ -296,79 +338,122 @@ createListenSocket = do
   return listenSocket
 
 
-requestLoop :: MVar ()
-            -> MVar ()
+daemonize :: IO ()
+daemonize = do
+  putStrLn $ "Pretend-daemonizing."
+
+
+requestLoop :: MVar (Maybe Handle)
+            -> MVar (Maybe Handle)
             -> Network.Socket
             -> Network.SockAddr
             -> (IO () -> IO ThreadId)
             -> HTTP ()
             -> IO ()
-requestLoop accessLogMVar errorLogMVar socket peer fork handler = do
+requestLoop accessLogMaybeHandleMVar
+            errorLogMaybeHandleMVar
+            socket
+            peer
+            fork
+            handler = do
   inputBufferMVar <- newMVar $ BS.empty
+  queryStringMVar <- newEmptyMVar
+  remoteHostnameMVar <- newMVar Nothing
+  requestMethodMVar <- newEmptyMVar
+  requestURIMVar <- newEmptyMVar
+  requestProtocolMVar <- newEmptyMVar
   let state = HTTPState {
-                httpStateAccessLogMVar = accessLogMVar,
-                httpStateErrorLogMVar = errorLogMVar,
+                httpStateAccessLogMaybeHandleMVar = accessLogMaybeHandleMVar,
+                httpStateErrorLogMaybeHandleMVar = errorLogMaybeHandleMVar,
                 httpStateSocket = socket,
                 httpStatePeer = peer,
-                httpStateInputBufferMVar = inputBufferMVar
+                httpStateInputBufferMVar = inputBufferMVar,
+                httpStateQueryString = queryStringMVar,
+                httpStateRemoteHostname = remoteHostnameMVar,
+                httpStateRequestMethod = requestMethodMVar,
+                httpStateRequestURI = requestURIMVar,
+                httpStateRequestProtocol = requestProtocolMVar
               }
   maybeRequestInfo <- runReaderT recvHeaders state
   case maybeRequestInfo of
     Nothing -> do
+      peerString <- case peer of
+                      Network.SockAddrInet _ address
+                        -> liftIO $ Network.inet_ntoa address
+      flip runReaderT state $ httpLog $ "Invalid request from " ++ peerString
+                              ++ "; closing its connection."
       liftIO $ Exception.catch (Network.sClose socket)
                                (\error -> do
                                   return $ error :: IO Exception.IOException
                                   return ())
       return ()
     Just (method, url, protocol, headers) -> do
+      putMVar queryStringMVar Nothing -- TODO
+      putMVar requestMethodMVar $ UTF8.toString method
+      putMVar requestURIMVar $ UTF8.toString url
+      putMVar requestProtocolMVar $ UTF8.toString protocol
       fork $ do
         Exception.catch
           (flip runReaderT state $ do
              handler
              httpCloseOutput
-             peerString <- case peer of
-                             Network.SockAddrInet _ address
-                               -> liftIO $ Network.inet_ntoa address
-             identString <- return "-"
-             usernameString <- return "-"
-             timestampString <- return "10/Oct/2000:13:55:36 -0700"
-             responseCodeString <- return $ show 200
-             maybeResponseSize <- return Nothing :: HTTP (Maybe Int)
-             responseSizeString
-               <- case maybeResponseSize of
-                    Nothing -> return "-"
-                    Just responseSize -> return $ show responseSize
-             referrerString <- return "http://www.example.com/start.html"
-             userAgentString <- return "Mozilla/4.08 [en] (Win98; I ;Nav)"
-             httpAccessLog $ peerString
-                             ++ " "
-                             ++ identString
-                             ++ " "
-                             ++ usernameString
-                             ++ " ["
-                             ++ timestampString
-                             ++ "] \""
-                             ++ (UTF8.toString method)
-                             ++ " "
-                             ++ (UTF8.toString url)
-                             ++ " "
-                             ++ (UTF8.toString protocol)
-                             ++ "\" "
-                             ++ responseCodeString
-                             ++ " "
-                             ++ responseSizeString
-                             ++ " \""
-                             ++ referrerString
-                             ++ "\" \""
-                             ++ userAgentString
-                             ++ "\""
-             handler)
+             logAccess)
           (\error -> flip runReaderT state $ do
             httpLog $ "Uncaught exception: "
                       ++ (show (error :: Exception.SomeException))
             httpCloseOutput)
         return ()
-      requestLoop accessLogMVar errorLogMVar socket peer fork handler
+      requestLoop accessLogMaybeHandleMVar
+                  errorLogMaybeHandleMVar
+                  socket
+                  peer
+                  fork
+                  handler
+
+
+logAccess :: HTTP ()
+logAccess = do
+  HTTPState { httpStatePeer = peer } <- getHTTPState
+  peerString <- case peer of
+                  Network.SockAddrInet _ address
+                    -> liftIO $ Network.inet_ntoa address
+  identString <- return "-"
+  usernameString <- return "-"
+  timestampString <- return "10/Oct/2000:13:55:36 -0700"
+  methodString <- getRequestMethod >>= return . fromJust
+  urlString <- getRequestURI >>= return . fromJust
+  HTTPState { httpStateRequestProtocol = protocolMVar } <- getHTTPState
+  protocolString <- liftIO $ readMVar protocolMVar
+  responseCodeString <- return $ show 200
+  maybeResponseSize <- return Nothing :: HTTP (Maybe Int)
+  responseSizeString
+    <- case maybeResponseSize of
+         Nothing -> return "-"
+         Just responseSize -> return $ show responseSize
+  referrerString <- return "http://www.example.com/start.html"
+  userAgentString <- return "Mozilla/4.08 [en] (Win98; I ;Nav)"
+  httpAccessLog $ peerString
+                  ++ " "
+                  ++ identString
+                  ++ " "
+                  ++ usernameString
+                  ++ " ["
+                  ++ timestampString
+                  ++ "] \""
+                  ++ methodString
+                  ++ " "
+                  ++ urlString
+                  ++ " "
+                  ++ protocolString
+                  ++ "\" "
+                  ++ responseCodeString
+                  ++ " "
+                  ++ responseSizeString
+                  ++ " \""
+                  ++ referrerString
+                  ++ "\" \""
+                  ++ userAgentString
+                  ++ "\""
 
 
 parseCookies :: String -> [Cookie]
@@ -590,15 +675,25 @@ extendInputBuffer inputBuffer length = do
 -- | Logs a message using the web server's logging facility.
 httpLog :: (MonadHTTP m) => String -> m ()
 httpLog message = do
-  HTTPState { httpStateErrorLogMVar = logMVar } <- getHTTPState
-  liftIO $ withMVar logMVar (\() -> putStrLn message)
+  HTTPState { httpStateErrorLogMaybeHandleMVar = logMVar } <- getHTTPState
+  liftIO $ withMVar logMVar
+                    (\maybeHandle -> case maybeHandle of
+                                       Nothing -> return ()
+                                       Just handle -> do
+                                         hPutStrLn handle message
+                                         hFlush handle)
 
 
 -- | Logs a message using the web server's logging facility.
 httpAccessLog :: (MonadHTTP m) => String -> m ()
 httpAccessLog message = do
-  HTTPState { httpStateAccessLogMVar = logMVar } <- getHTTPState
-  liftIO $ withMVar logMVar (\() -> putStrLn message)
+  HTTPState { httpStateAccessLogMaybeHandleMVar = logMVar } <- getHTTPState
+  liftIO $ withMVar logMVar
+                    (\maybeHandle -> case maybeHandle of
+                                       Nothing -> return ()
+                                       Just handle -> do
+                                         hPutStrLn handle message
+                                         hFlush handle)
 
 
 -- | Headers are classified by HTTP/1.1 as request headers, response headers, or
@@ -926,6 +1021,9 @@ getRequestVariable _ = return Nothing
 -- | Returns an association list of name-value pairs of all the CGI/1.1 request
 --   variables from the web server.  This interface is provided as a convenience
 --   to programs which were originally written against the CGI or FastCGI APIs.
+--   Its use is not recommended if only some values are needed, because it
+--   implicitly calls getRemoteHost and getRemoteIdent, which are potentially
+--   time-consuming.
 getAllRequestVariables
     :: (MonadHTTP m) => m [(String, String)]
 getAllRequestVariables = do
@@ -993,169 +1091,197 @@ getCookieValue name = do
   -- TODO
 
 
--- | Return the document root, as provided by the web server, if it was provided.
+-- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
+--   the corresponding function would return the document root.
 getDocumentRoot :: (MonadHTTP m) => m (Maybe String)
 getDocumentRoot = do
   return Nothing
-  -- TODO
 
 
--- | Return the gateway interface, as provided by the web server, if it was provided.
+-- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
+--   the corresponding function would return the gateway interface.
 getGatewayInterface :: (MonadHTTP m) => m (Maybe String)
 getGatewayInterface = do
   return Nothing
-  -- TODO
 
 
--- | Return the path info, as provided by the web server, if it was provided.
+-- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
+--   the corresponding function would return the path info.
 getPathInfo :: (MonadHTTP m) => m (Maybe String)
 getPathInfo = do
   return Nothing
-  -- TODO
 
 
--- | Return the path-translated value, as provided by the web server, if it was provided.
+-- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
+--   the corresponding function would return the path-translated value.
 getPathTranslated :: (MonadHTTP m) => m (Maybe String)
 getPathTranslated = do
   return Nothing
-  -- TODO
 
 
--- | Return the query string, as provided by the web server, if it was provided.
+-- | Return the query string, as provided by the user agent.
 getQueryString :: (MonadHTTP m) => m (Maybe String)
 getQueryString = do
-  return Nothing
-  -- TODO
+  HTTPState { httpStateQueryString = mvar } <- getHTTPState
+  liftIO $ readMVar mvar
 
 
--- | Return the redirect status, as provided by the web server, if it was provided.
+-- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
+--   the corresponding function would return the redirect status.
 getRedirectStatus :: (MonadHTTP m) => m (Maybe Int)
 getRedirectStatus = do
   return Nothing
-  -- TODO
 
 
--- | Return the redirect URI, as provided by the web server, if it was provided.
+-- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
+--   the corresponding function would return the redirect URI.
 getRedirectURI :: (MonadHTTP m) => m (Maybe String)
 getRedirectURI = do
   return Nothing
-  -- TODO
 
 
--- | Return the remote address, as provided by the web server, if it was provided.
+-- | Return the remote address.
 getRemoteAddress :: (MonadHTTP m) => m (Maybe Network.HostAddress)
 getRemoteAddress = do
-  return Nothing
-  -- TODO
+  HTTPState { httpStatePeer = peer } <- getHTTPState
+  case peer of
+    Network.SockAddrInet _ address -> return $ Just address
 
 
--- | Return the remote port, as provided by the web server, if it was provided.
+-- | Return the remote port.
 getRemotePort :: (MonadHTTP m) => m (Maybe Int)
 getRemotePort = do
-  return Nothing
-  -- TODO
+  HTTPState { httpStatePeer = peer } <- getHTTPState
+  case peer of
+    Network.SockAddrInet port _ -> do
+      return $ Just $ fromIntegral port
 
 
--- | Return the remote hostname, as provided by the web server, if it was provided.
+-- | Return the remote hostname, as determined by the web server.  If it has
+--   not yet been looked up, performs the lookup.  This is potentially
+--   time-consuming.
 getRemoteHost :: (MonadHTTP m) => m (Maybe String)
 getRemoteHost = do
-  return Nothing
-  -- TODO
+  HTTPState { httpStateRemoteHostname = mvar } <- getHTTPState
+  maybeMaybeHostname <- liftIO $ readMVar mvar
+  case maybeMaybeHostname of
+    Nothing -> do
+      HTTPState { httpStatePeer = peer } <- getHTTPState
+      inputHostname <- case peer of
+        Network.SockAddrInet _ address -> do
+          string <- liftIO $ Network.inet_ntoa address
+          return string
+      maybeValues <- liftIO $ Network.getAddrInfo
+                               (Just $ Network.defaultHints {
+                                         Network.addrFlags
+                                           = [Network.AI_CANONNAME]
+                                       })
+                               (Just inputHostname)
+                               Nothing
+      let maybeHostname = case maybeValues of
+                            (Network.AddrInfo {
+                                        Network.addrCanonName = Just result
+                                      }:_)
+                              -> Just result
+                            _ -> Nothing
+      liftIO $ swapMVar mvar $ Just maybeHostname
+      return maybeHostname
+    Just maybeHostname -> return maybeHostname
 
 
--- | Return the remote ident value, as provided by the web server, if it was provided.
+-- | Return the remote ident value, as determined by the web server.  If it has
+--   not yet been looked up, performs the lookup.  This is potentially
+--   time-consuming.  Not yet implemented; currently, always returns Nothing.
 getRemoteIdent :: (MonadHTTP m) => m (Maybe String)
 getRemoteIdent = do
   return Nothing
-  -- TODO
 
 
--- | Return the remote user name, as provided by the web server, if it was provided.
+-- | Return the remote user name.  Not yet implemented; currently, always
+--   returns Nothing.
 getRemoteUser :: (MonadHTTP m) => m (Maybe String)
 getRemoteUser = do
   return Nothing
   -- TODO
 
 
--- | Return the request method, as provided by the web server, if it was provided.
+-- | Return the request method.
 getRequestMethod :: (MonadHTTP m) => m (Maybe String)
 getRequestMethod = do
-  return Nothing
-  -- TODO
+  HTTPState { httpStateRequestMethod = mvar } <- getHTTPState
+  liftIO $ readMVar mvar >>= return . Just
 
 
--- | Return the request URI, as provided by the web server, if it was provided.
+-- | Return the request URI.
 getRequestURI :: (MonadHTTP m) => m (Maybe String)
 getRequestURI = do
-  return Nothing
-  -- TODO
+  HTTPState { httpStateRequestURI = mvar } <- getHTTPState
+  liftIO $ readMVar mvar >>= return . Just
 
 
--- | Return the script filename, as provided by the web server, if it was provided.
+-- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
+--   the corresponding function would return the script filename.
 getScriptFilename :: (MonadHTTP m) => m (Maybe String)
 getScriptFilename = do
   return Nothing
-  -- TODO
 
 
--- | Return the script name, as provided by the web server, if it was provided.
+-- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
+--   the corresponding function would return the script name.
 getScriptName :: (MonadHTTP m) => m (Maybe String)
 getScriptName = do
   return Nothing
-  -- TODO
 
 
--- | Return the server address, as provided by the web server, if it was provided.
+-- | Return the server address.
 getServerAddress :: (MonadHTTP m) => m (Maybe Network.HostAddress)
 getServerAddress = do
   return Nothing
   -- TODO
 
 
--- | Return the server name, as provided by the web server, if it was provided.
+-- | Return the server name.
 getServerName :: (MonadHTTP m) => m (Maybe String)
 getServerName = do
   return Nothing
   -- TODO
 
 
--- | Return the server port, as provided by the web server, if it was provided.
+-- | Return the server port.
 getServerPort :: (MonadHTTP m) => m (Maybe Int)
 getServerPort = do
   return Nothing
   -- TODO
 
 
--- | Return the server protocol, as provided by the web server, if it was provided.
+-- | Return the server protocol.
 getServerProtocol :: (MonadHTTP m) => m (Maybe String)
 getServerProtocol = do
   return Nothing
   -- TODO
 
 
--- | Return the server software name and version, as provided by the web server, if
---   it was provided.
+-- | Return the server software name and version.
 getServerSoftware :: (MonadHTTP m) => m (Maybe String)
 getServerSoftware = do
-  return Nothing
-  -- TODO
+  return $ Just "direct-http 1.0"
 
 
--- | Return the authentication type, as provided by the web server, if it was provided.
+-- | Return the authentication type.
 getAuthenticationType :: (MonadHTTP m) => m (Maybe String)
 getAuthenticationType = do
   return Nothing
   -- TODO
 
 
--- | Return the content length, as provided by the web server, if it was provided.
+-- | Return the content length.
 getContentLength :: (MonadHTTP m) => m (Maybe Int)
 getContentLength = do
   return Nothing
   -- TODO
 
 
--- | Return the content type, as provided by the web server, if it was provided.
+-- | Return the content type.
 getContentType :: (MonadHTTP m) => m (Maybe String)
 getContentType = do
   return Nothing
