@@ -299,7 +299,12 @@ requestLoop :: MVar ()
             -> HTTP ()
             -> IO ()
 requestLoop logMVar socket peer fork handler = do
-  maybeHeaders <- recvHeaders socket
+  let state = HTTPState {
+                httpStateLogMVar = logMVar,
+                httpStateSocket = socket,
+                httpStatePeer = peer
+              }
+  maybeHeaders <- runReaderT recvHeaders state
   case maybeHeaders of
     Nothing -> do
       liftIO $ Exception.catch (Network.sClose socket)
@@ -308,11 +313,6 @@ requestLoop logMVar socket peer fork handler = do
                                   return ())
       return ()
     Just headers -> do
-      let state = HTTPState {
-                      httpStateLogMVar = logMVar,
-                      httpStateSocket = socket,
-                      httpStatePeer = peer
-                    }
       fork $ do
         Exception.catch
           (runReaderT handler state)
@@ -444,8 +444,9 @@ parseInt string =
       else Nothing
 
 
-recvHeaders :: Network.Socket -> IO (Maybe (Map Header String))
-recvHeaders socket = do
+recvHeaders :: HTTP (Maybe (Map Header String))
+recvHeaders = do
+  HTTPState { httpStateSocket = socket } <- getHTTPState
   byteString <- liftIO $ Network.recv socket 1
   case BS.length byteString of
     0 -> return Nothing
