@@ -135,8 +135,9 @@ import Control.Concurrent
 import qualified Control.Exception as Exception
 import Control.Monad.Reader
 import Data.Bits
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import qualified Data.ByteString.UTF8 as BS (toString, fromString)
+import qualified Data.ByteString.UTF8 as UTF8
 import Data.Char
 import Data.List
 import Data.Map (Map)
@@ -157,9 +158,11 @@ import qualified System.IO.Error as System
 -- | An opaque type representing the state of the HTTP server during a single
 --   connection from a client.
 data HTTPState = HTTPState {
-    httpStateLogMVar :: MVar (),
+    httpStateAccessLogMVar :: MVar (),
+    httpStateErrorLogMVar :: MVar (),
     httpStateSocket :: Network.Socket,
-    httpStatePeer :: Network.SockAddr
+    httpStatePeer :: Network.SockAddr,
+    httpStateInputBufferMVar :: MVar ByteString
   }
 
 
@@ -269,10 +272,11 @@ acceptLoop shouldDaemonize fork handler = do
     then do
       daemonize
     else return ()
-  logMVar <- newMVar ()
+  accessLogMVar <- newMVar ()
+  errorLogMVar <- newMVar ()
   let acceptLoop' = do
         (socket, peer) <- Network.accept listenSocket
-        requestLoop logMVar socket peer fork handler
+        requestLoop accessLogMVar errorLogMVar socket peer fork handler
         acceptLoop'
   acceptLoop'
 
@@ -293,35 +297,78 @@ createListenSocket = do
 
 
 requestLoop :: MVar ()
+            -> MVar ()
             -> Network.Socket
             -> Network.SockAddr
             -> (IO () -> IO ThreadId)
             -> HTTP ()
             -> IO ()
-requestLoop logMVar socket peer fork handler = do
+requestLoop accessLogMVar errorLogMVar socket peer fork handler = do
+  inputBufferMVar <- newMVar $ BS.empty
   let state = HTTPState {
-                httpStateLogMVar = logMVar,
+                httpStateAccessLogMVar = accessLogMVar,
+                httpStateErrorLogMVar = errorLogMVar,
                 httpStateSocket = socket,
-                httpStatePeer = peer
+                httpStatePeer = peer,
+                httpStateInputBufferMVar = inputBufferMVar
               }
-  maybeHeaders <- runReaderT recvHeaders state
-  case maybeHeaders of
+  maybeRequestInfo <- runReaderT recvHeaders state
+  case maybeRequestInfo of
     Nothing -> do
       liftIO $ Exception.catch (Network.sClose socket)
                                (\error -> do
                                   return $ error :: IO Exception.IOException
                                   return ())
       return ()
-    Just headers -> do
+    Just (method, url, protocol, headers) -> do
       fork $ do
         Exception.catch
-          (runReaderT handler state)
+          (flip runReaderT state $ do
+             handler
+             httpCloseOutput
+             peerString <- case peer of
+                             Network.SockAddrInet _ address
+                               -> liftIO $ Network.inet_ntoa address
+             identString <- return "-"
+             usernameString <- return "-"
+             timestampString <- return "10/Oct/2000:13:55:36 -0700"
+             responseCodeString <- return $ show 200
+             maybeResponseSize <- return Nothing :: HTTP (Maybe Int)
+             responseSizeString
+               <- case maybeResponseSize of
+                    Nothing -> return "-"
+                    Just responseSize -> return $ show responseSize
+             referrerString <- return "http://www.example.com/start.html"
+             userAgentString <- return "Mozilla/4.08 [en] (Win98; I ;Nav)"
+             httpAccessLog $ peerString
+                             ++ " "
+                             ++ identString
+                             ++ " "
+                             ++ usernameString
+                             ++ " ["
+                             ++ timestampString
+                             ++ "] \""
+                             ++ (UTF8.toString method)
+                             ++ " "
+                             ++ (UTF8.toString url)
+                             ++ " "
+                             ++ (UTF8.toString protocol)
+                             ++ "\" "
+                             ++ responseCodeString
+                             ++ " "
+                             ++ responseSizeString
+                             ++ " \""
+                             ++ referrerString
+                             ++ "\" \""
+                             ++ userAgentString
+                             ++ "\""
+             handler)
           (\error -> flip runReaderT state $ do
             httpLog $ "Uncaught exception: "
                       ++ (show (error :: Exception.SomeException))
             httpCloseOutput)
         return ()
-      requestLoop logMVar socket peer fork handler
+      requestLoop accessLogMVar errorLogMVar socket peer fork handler
 
 
 parseCookies :: String -> [Cookie]
@@ -444,22 +491,113 @@ parseInt string =
       else Nothing
 
 
-recvHeaders :: HTTP (Maybe (Map Header String))
+recvHeaders :: HTTP (Maybe (ByteString,
+                            ByteString,
+                            ByteString,
+                            Map Header ByteString))
 recvHeaders = do
+  HTTPState { httpStateInputBufferMVar = inputBufferMVar } <- getHTTPState
+  inputBuffer <- liftIO $ takeMVar inputBufferMVar
+  (inputBuffer, maybeLine) <- recvLine inputBuffer
+  liftIO $ putMVar inputBufferMVar inputBuffer
+  case maybeLine of
+    Nothing -> return Nothing
+    Just line -> do
+      let computeWords input =
+            let (before, after) = BS.breakSubstring (UTF8.fromString " ") input
+            in if BS.null after
+              then [before]
+              else let rest = computeWords $ BS.drop 1 after
+                   in before : rest
+          words = computeWords line
+      case words of
+        [method, url, protocol]
+          | (isValidMethod method)
+            && (isValidURL url)
+            && (isValidProtocol protocol)
+          -> return $ Just (method, url, protocol, Map.empty)
+        _ -> return Nothing
+
+
+isValidMethod :: ByteString -> Bool
+isValidMethod bytestring
+  | bytestring == UTF8.fromString "OPTIONS" = True
+  | bytestring == UTF8.fromString "GET" = True
+  | bytestring == UTF8.fromString "HEAD" = True
+  | bytestring == UTF8.fromString "POST" = True
+  | bytestring == UTF8.fromString "PUT" = True
+  | bytestring == UTF8.fromString "DELETE" = True
+  | bytestring == UTF8.fromString "TRACE" = True
+  | bytestring == UTF8.fromString "CONNECT" = True
+  | otherwise = False
+
+
+isValidURL :: ByteString -> Bool
+isValidURL _ = True
+
+
+isValidProtocol :: ByteString -> Bool
+isValidProtocol bytestring
+  | bytestring == UTF8.fromString "HTTP/1.0" = True
+  | bytestring == UTF8.fromString "HTTP/1.1" = True
+  | otherwise = False
+
+
+recvLine :: ByteString -> HTTP (ByteString, Maybe ByteString)
+recvLine inputBuffer = do
+  let loop inputBuffer length = do
+        (inputBuffer, endOfInput)
+          <- singleAttemptExtendInputBuffer inputBuffer length
+        let (before, after)
+              = BS.breakSubstring (UTF8.fromString "\r\n") inputBuffer
+        if BS.null after
+          then if endOfInput
+                 then return (inputBuffer, Nothing)
+                 else loop inputBuffer $ length + 80
+          else do
+            let result = before
+                inputBuffer = BS.drop 2 after
+            return (inputBuffer, Just result)
+  loop inputBuffer 80
+
+
+singleAttemptExtendInputBuffer :: ByteString -> Int -> HTTP (ByteString, Bool)
+singleAttemptExtendInputBuffer inputBuffer length = do
   HTTPState { httpStateSocket = socket } <- getHTTPState
-  byteString <- liftIO $ Network.recv socket 1
-  case BS.length byteString of
-    0 -> return Nothing
-    1 -> do
-      return $ Just $ Map.empty
-    _ -> return Nothing
-  -- TODO
+  if BS.length inputBuffer < length
+    then do
+      newInput <- liftIO $ Network.recv socket 4096
+      if BS.null newInput
+        then return (inputBuffer, True)
+        else return (BS.append inputBuffer newInput, False)
+    else return (inputBuffer, False)
+
+
+extendInputBuffer :: ByteString -> Int -> HTTP (ByteString, Bool)
+extendInputBuffer inputBuffer length = do
+  HTTPState { httpStateSocket = socket } <- getHTTPState
+  let loop inputBuffer = do
+        if BS.length inputBuffer < length
+          then do
+            newInput <- liftIO $ Network.recv socket 4096
+            if BS.null newInput
+              then return (inputBuffer, True)
+              else loop $ BS.append inputBuffer newInput
+          else return (inputBuffer, False)
+  loop inputBuffer
 
 
 -- | Logs a message using the web server's logging facility.
 httpLog :: (MonadHTTP m) => String -> m ()
 httpLog message = do
-  HTTPState { httpStateLogMVar = logMVar } <- getHTTPState
+  HTTPState { httpStateErrorLogMVar = logMVar } <- getHTTPState
+  liftIO $ withMVar logMVar (\() -> putStrLn message)
+
+
+-- | Logs a message using the web server's logging facility.
+httpAccessLog :: (MonadHTTP m) => String -> m ()
+httpAccessLog message = do
+  HTTPState { httpStateAccessLogMVar = logMVar } <- getHTTPState
   liftIO $ withMVar logMVar (\() -> putStrLn message)
 
 
@@ -1454,9 +1592,9 @@ sendResponseHeaders = do
                                  else [])
           setCookieValue = printCookies $ Map.elems responseCookieMap
           bytestrings
-              = (map (\(name, value) -> BS.fromString $ name ++ ": " ++ value ++ "\r\n")
+              = (map (\(name, value) -> UTF8.fromString $ name ++ ": " ++ value ++ "\r\n")
                      nameValuePairs)
-                ++ [BS.fromString "\r\n"]
+                ++ [UTF8.fromString "\r\n"]
           buffer = foldl BS.append BS.empty bytestrings
       sendBuffer buffer
     else return ()
@@ -1492,7 +1630,7 @@ httpPut buffer = do
 --   if the response headers have not been sent, first sends them.  If output has
 --   already been closed, causes an 'OutputAlreadyClosed' exception.
 httpPutStr :: (MonadHTTP m) => String -> m ()
-httpPutStr string = httpPut $ BS.fromString string
+httpPutStr string = httpPut $ UTF8.fromString string
 
 
 -- | Informs the web server and the user agent that the request has completed.  As
