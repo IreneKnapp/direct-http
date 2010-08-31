@@ -10,9 +10,6 @@ module Network.HTTP (
              implementationBlockHTTP,
              implementationUnblockHTTP,
              
-             -- * Running as a daemon
-             daemonize,
-             
              -- * Accepting requests
              acceptLoop,
              
@@ -237,21 +234,15 @@ instance MonadHTTP HTTP where
       liftIO $ Exception.unblock (runReaderT action state)
 
 
--- | Closes the standard IO streams and moves the process into the background,
---   doing all the usual Unix things to make it run as a daemon henceforth.
-daemonize :: IO ()
-daemonize = do
-  putStrLn $ "Pretend-daemonizing."
-
-
-
 -- | Takes a forking primitive, such as 'forkIO' or 'forkOS', and a handler, and
 --   concurrently accepts requests from the web server, forking with the primitive
 --   and invoking the handler in the forked thread inside the 'HTTP' monad for each
 --   one.
 --   
---   Note that daemonize needs to be called explicitly prior to calling acceptLoop if
---   its behavior is desired; it might not be, for example for debugging purposes.
+--   If the daemonize flag is True, first closes the standard IO streams and moves
+--   the process into the background, doing all the usual Unix things to make it run
+--   as a daemon henceforth.  This is optional because it might be useful to turn it
+--   off for debugging purposes.
 --   
 --   It is valid to use a custom forking primitive, such as one that attempts to pool
 --   OS threads, but the primitive must actually provide concurrency - otherwise there
@@ -264,20 +255,31 @@ daemonize = do
 --   Any exceptions not caught within the handler are caught by 'concurrentAcceptLoop',
 --   and cause the termination of that handler, but not of the accept loop.
 acceptLoop
-    :: (IO () -> IO ThreadId)
+    :: Bool
+    -- ^ A flag which indicates whether to daemonize.
+    -> (IO () -> IO ThreadId)
     -- ^ A forking primitive, typically either 'forkIO' or 'forkOS'.
     -> (HTTP ())
     -- ^ A handler which is invoked once for each incoming connection.
     -> IO ()
     -- ^ Never actually returns.
-acceptLoop fork handler = do
+acceptLoop shouldDaemonize fork handler = do
   listenSocket <- createListenSocket
+  if shouldDaemonize
+    then do
+      daemonize
+    else return ()
   logMVar <- newMVar ()
   let acceptLoop' = do
         (socket, peer) <- Network.accept listenSocket
         requestLoop logMVar socket peer fork handler
         acceptLoop'
   acceptLoop'
+
+
+daemonize :: IO ()
+daemonize = do
+  putStrLn $ "Pretend-daemonizing."
 
 
 createListenSocket :: IO Network.Socket
