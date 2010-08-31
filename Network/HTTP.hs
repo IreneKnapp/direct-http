@@ -10,6 +10,9 @@ module Network.HTTP (
              implementationBlockHTTP,
              implementationUnblockHTTP,
              
+             -- * Running as a daemon
+             daemonize,
+             
              -- * Accepting requests
              acceptLoop,
              
