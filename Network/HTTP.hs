@@ -169,7 +169,11 @@ data HTTPState = HTTPState {
     httpStateRemoteHostname :: MVar (Maybe (Maybe String)),
     httpStateRequestMethod :: MVar String,
     httpStateRequestURI :: MVar String,
-    httpStateRequestProtocol :: MVar String
+    httpStateRequestProtocol :: MVar String,
+    httpStateResponseHeadersSent :: MVar Bool,
+    httpStateResponseStatus :: MVar Int,
+    httpStateResponseHeaderMap :: MVar (Map Header ByteString),
+    httpStateResponseCookieMap :: MVar (Map String Cookie)
   }
 
 
@@ -362,6 +366,11 @@ requestLoop accessLogMaybeHandleMVar
   requestMethodMVar <- newEmptyMVar
   requestURIMVar <- newEmptyMVar
   requestProtocolMVar <- newEmptyMVar
+  responseHeadersSentMVar <- newMVar $ False
+  responseStatusMVar <- newMVar $ 200
+  responseHeaderMapMVar <- newMVar $ Map.fromList
+                           [(HttpContentType, UTF8.fromString "text/html")]
+  responseCookieMapMVar <- newMVar $ Map.empty
   let state = HTTPState {
                 httpStateAccessLogMaybeHandleMVar = accessLogMaybeHandleMVar,
                 httpStateErrorLogMaybeHandleMVar = errorLogMaybeHandleMVar,
@@ -372,7 +381,11 @@ requestLoop accessLogMaybeHandleMVar
                 httpStateRemoteHostname = remoteHostnameMVar,
                 httpStateRequestMethod = requestMethodMVar,
                 httpStateRequestURI = requestURIMVar,
-                httpStateRequestProtocol = requestProtocolMVar
+                httpStateRequestProtocol = requestProtocolMVar,
+                httpStateResponseHeadersSent = responseHeadersSentMVar,
+                httpStateResponseStatus = responseStatusMVar,
+                httpStateResponseHeaderMap = responseHeaderMapMVar,
+                httpStateResponseCookieMap = responseCookieMapMVar
               }
   maybeRequestInfo <- runReaderT recvHeaders state
   case maybeRequestInfo of
@@ -529,22 +542,25 @@ parseCookies value =
   in takeCookie pairs'
 
 
-printCookies :: [Cookie] -> String
+printCookies :: [Cookie] -> ByteString
 printCookies cookies =
     let printCookie cookie
-            = intercalate ";" $ map printNameValuePair $ nameValuePairs cookie
-        printNameValuePair (name, Nothing) = name
+            = BS.intercalate (UTF8.fromString ";")
+                             $ map printNameValuePair $ nameValuePairs cookie
+        printNameValuePair (name, Nothing) = UTF8.fromString name
         printNameValuePair (name, Just value)
-            = name ++ "=" ++ value
+            = BS.concat [UTF8.fromString name,
+                         UTF8.fromString "=",
+                         UTF8.fromString value]
         {- Safari doesn't like this.
             = if isValidCookieToken value
                 then name ++ "=" ++ value
                 else name ++ "=\"" ++ escape value ++ "\""
-         -}
         escape "" = ""
         escape ('\\':rest) = "\\\\" ++ escape rest
         escape ('\"':rest) = "\\\"" ++ escape rest
         escape (c:rest) = [c] ++ escape rest
+         -}
         nameValuePairs cookie = [(cookieName cookie, Just $ cookieValue cookie)]
                                 ++ (case cookieComment cookie of
                                       Nothing -> []
@@ -562,7 +578,7 @@ printCookies cookies =
                                       False -> []
                                       True -> [("Secure", Nothing)])
                                 ++ [("Version", Just $ show $ cookieVersion cookie)]
-    in intercalate "," $ map printCookie cookies
+    in BS.intercalate (UTF8.fromString ",") $ map printCookie cookies
 
 
 parseInt :: String -> Maybe Int
@@ -598,16 +614,53 @@ recvHeaders = do
           | (isValidMethod method)
             && (isValidURL url)
             && (isValidProtocol protocol)
-          -> return $ Just (method, url, protocol, Map.empty)
+          -> do
+            let loop headersSoFar = do
+                  (inputBuffer, maybeLine) <- recvLine inputBuffer
+                  case maybeLine of
+                    Nothing -> return Nothing
+                    Just line
+                      | line == BS.empty -> do
+                          return $ Just (method, url, protocol, headersSoFar)
+                      | otherwise -> do
+                          case parseHeader line of
+                            Nothing -> do
+                              logInvalidRequest
+                              return Nothing
+                            Just (header, value) -> do
+                              let headersSoFar'
+                                   = case Map.lookup header headersSoFar of
+                                       Nothing -> Map.insert header
+                                                             value
+                                                             headersSoFar
+                                       Just oldValue
+                                         -> Map.insert
+                                            header
+                                            (BS.concat [oldValue,
+                                                        (UTF8.fromString ","),
+                                                        value])
+                                            headersSoFar
+                              loop headersSoFar'
+            loop Map.empty
         _ -> do
-          HTTPState { httpStatePeer = Network.SockAddrInet _ address }
-            <- getHTTPState
-          peerString <- liftIO $ Network.inet_ntoa address
-          httpLog $ "Invalid request from " ++ peerString
-                    ++ "; closing its connection."
+          logInvalidRequest
           return Nothing
   liftIO $ putMVar inputBufferMVar inputBuffer
   return result
+
+
+parseHeader :: ByteString -> Maybe (Header, ByteString)
+parseHeader line = do
+  case BS.breakSubstring (UTF8.fromString ":") line of
+    (_, bytestring) | bytestring == BS.empty -> Nothing
+    (name, delimitedValue) -> Just (toHeader name, BS.drop 1 delimitedValue)
+
+
+logInvalidRequest :: HTTP ()
+logInvalidRequest = do
+  HTTPState { httpStatePeer = Network.SockAddrInet _ address } <- getHTTPState
+  peerString <- liftIO $ Network.inet_ntoa address
+  httpLog $ "Invalid request from " ++ peerString ++ "; closing its connection."
 
 
 isValidMethod :: ByteString -> Bool
@@ -746,7 +799,7 @@ data Header
     | HttpContentType
     | HttpExpires
     | HttpLastModified
-    | HttpExtensionHeader String
+    | HttpExtensionHeader ByteString
     -- | Nonstandard headers
     | HttpConnection
     | HttpCookie
@@ -755,7 +808,7 @@ data Header
 
 
 instance Show Header where 
-    show header = fromHeader header
+    show header = UTF8.toString $ fromHeader header
 
 
 data HeaderType = RequestHeader
@@ -809,101 +862,102 @@ headerType HttpCookie = RequestHeader
 headerType HttpSetCookie = ResponseHeader
 
 
-fromHeader :: Header -> String
-fromHeader HttpAccept = "Accept"
-fromHeader HttpAcceptCharset = "Accept-Charset"
-fromHeader HttpAcceptEncoding = "Accept-Encoding"
-fromHeader HttpAcceptLanguage = "Accept-Language"
-fromHeader HttpAuthorization = "Authorization"
-fromHeader HttpExpect = "Expect"
-fromHeader HttpFrom = "From"
-fromHeader HttpHost = "Host"
-fromHeader HttpIfMatch = "If-Match"
-fromHeader HttpIfModifiedSince = "If-Modified-Since"
-fromHeader HttpIfNoneMatch = "If-None-Match"
-fromHeader HttpIfRange = "If-Range"
-fromHeader HttpIfUnmodifiedSince = "If-Unmodified-Since"
-fromHeader HttpMaxForwards = "Max-Forwards"
-fromHeader HttpProxyAuthorization = "Proxy-Authorization"
-fromHeader HttpRange = "Range"
-fromHeader HttpReferer = "Referer"
-fromHeader HttpTE = "TE"
-fromHeader HttpUserAgent = "User-Agent"
-fromHeader HttpAcceptRanges = "Accept-Ranges"
-fromHeader HttpAge = "Age"
-fromHeader HttpETag = "ETag"
-fromHeader HttpLocation = "Location"
-fromHeader HttpProxyAuthenticate = "Proxy-Authenticate"
-fromHeader HttpRetryAfter = "Retry-After"
-fromHeader HttpServer = "Server"
-fromHeader HttpVary = "Vary"
-fromHeader HttpWWWAuthenticate = "WWW-Authenticate"
-fromHeader HttpAllow = "Allow"
-fromHeader HttpContentEncoding = "Content-Encoding"
-fromHeader HttpContentLanguage = "Content-Language"
-fromHeader HttpContentLength = "Content-Length"
-fromHeader HttpContentLocation = "Content-Location"
-fromHeader HttpContentMD5 = "Content-MD5"
-fromHeader HttpContentRange = "Content-Range"
-fromHeader HttpContentType = "Content-Type"
-fromHeader HttpExpires = "Expires"
-fromHeader HttpLastModified = "Last-Modified"
+fromHeader :: Header -> ByteString
+fromHeader HttpAccept = UTF8.fromString "Accept"
+fromHeader HttpAcceptCharset = UTF8.fromString "Accept-Charset"
+fromHeader HttpAcceptEncoding = UTF8.fromString "Accept-Encoding"
+fromHeader HttpAcceptLanguage = UTF8.fromString "Accept-Language"
+fromHeader HttpAuthorization = UTF8.fromString "Authorization"
+fromHeader HttpExpect = UTF8.fromString "Expect"
+fromHeader HttpFrom = UTF8.fromString "From"
+fromHeader HttpHost = UTF8.fromString "Host"
+fromHeader HttpIfMatch = UTF8.fromString "If-Match"
+fromHeader HttpIfModifiedSince = UTF8.fromString "If-Modified-Since"
+fromHeader HttpIfNoneMatch = UTF8.fromString "If-None-Match"
+fromHeader HttpIfRange = UTF8.fromString "If-Range"
+fromHeader HttpIfUnmodifiedSince = UTF8.fromString "If-Unmodified-Since"
+fromHeader HttpMaxForwards = UTF8.fromString "Max-Forwards"
+fromHeader HttpProxyAuthorization = UTF8.fromString "Proxy-Authorization"
+fromHeader HttpRange = UTF8.fromString "Range"
+fromHeader HttpReferer = UTF8.fromString "Referer"
+fromHeader HttpTE = UTF8.fromString "TE"
+fromHeader HttpUserAgent = UTF8.fromString "User-Agent"
+fromHeader HttpAcceptRanges = UTF8.fromString "Accept-Ranges"
+fromHeader HttpAge = UTF8.fromString "Age"
+fromHeader HttpETag = UTF8.fromString "ETag"
+fromHeader HttpLocation = UTF8.fromString "Location"
+fromHeader HttpProxyAuthenticate = UTF8.fromString "Proxy-Authenticate"
+fromHeader HttpRetryAfter = UTF8.fromString "Retry-After"
+fromHeader HttpServer = UTF8.fromString "Server"
+fromHeader HttpVary = UTF8.fromString "Vary"
+fromHeader HttpWWWAuthenticate = UTF8.fromString "WWW-Authenticate"
+fromHeader HttpAllow = UTF8.fromString "Allow"
+fromHeader HttpContentEncoding = UTF8.fromString "Content-Encoding"
+fromHeader HttpContentLanguage = UTF8.fromString "Content-Language"
+fromHeader HttpContentLength = UTF8.fromString "Content-Length"
+fromHeader HttpContentLocation = UTF8.fromString "Content-Location"
+fromHeader HttpContentMD5 = UTF8.fromString "Content-MD5"
+fromHeader HttpContentRange = UTF8.fromString "Content-Range"
+fromHeader HttpContentType = UTF8.fromString "Content-Type"
+fromHeader HttpExpires = UTF8.fromString "Expires"
+fromHeader HttpLastModified = UTF8.fromString "Last-Modified"
 fromHeader (HttpExtensionHeader name) = name
-fromHeader HttpConnection = "Connection"
-fromHeader HttpCookie = "Cookie"
-fromHeader HttpSetCookie = "Set-Cookie"
+fromHeader HttpConnection = UTF8.fromString "Connection"
+fromHeader HttpCookie = UTF8.fromString "Cookie"
+fromHeader HttpSetCookie = UTF8.fromString "Set-Cookie"
 
 
-toHeader :: String -> Header
-toHeader "Accept" = HttpAccept
-toHeader "Accept-Charset" = HttpAcceptCharset
-toHeader "Accept-Encoding" = HttpAcceptEncoding
-toHeader "Accept-Language" = HttpAcceptLanguage
-toHeader "Authorization" = HttpAuthorization
-toHeader "Expect" = HttpExpect
-toHeader "From" = HttpFrom
-toHeader "Host" = HttpHost
-toHeader "If-Match" = HttpIfMatch
-toHeader "If-Modified-Since" = HttpIfModifiedSince
-toHeader "If-None-Match" = HttpIfNoneMatch
-toHeader "If-Range" = HttpIfRange
-toHeader "If-Unmodified-Since" = HttpIfUnmodifiedSince
-toHeader "Max-Forwards" = HttpMaxForwards
-toHeader "Proxy-Authorization" = HttpProxyAuthorization
-toHeader "Range" = HttpRange
-toHeader "Referer" = HttpReferer
-toHeader "TE" = HttpTE
-toHeader "User-Agent" = HttpUserAgent
-toHeader "Accept-Ranges" = HttpAcceptRanges
-toHeader "Age" = HttpAge
-toHeader "ETag" = HttpETag
-toHeader "Location" = HttpLocation
-toHeader "Proxy-Authenticate" = HttpProxyAuthenticate
-toHeader "Retry-After" = HttpRetryAfter
-toHeader "Server" = HttpServer
-toHeader "Vary" = HttpVary
-toHeader "WWW-Authenticate" = HttpWWWAuthenticate
-toHeader "Allow" = HttpAllow
-toHeader "Content-Encoding" = HttpContentEncoding
-toHeader "Content-Language" = HttpContentLanguage
-toHeader "Content-Length" = HttpContentLength
-toHeader "Content-Location" = HttpContentLocation
-toHeader "Content-MD5" = HttpContentMD5
-toHeader "Content-Range" = HttpContentRange
-toHeader "Content-Type" = HttpContentType
-toHeader "Expires" = HttpExpires
-toHeader "Last-Modified" = HttpLastModified
-toHeader "Connection" = HttpConnection
-toHeader "Cookie" = HttpCookie
-toHeader "Set-Cookie" = HttpSetCookie
-toHeader name = HttpExtensionHeader name
+toHeader :: ByteString -> Header
+toHeader bytestring
+  | bytestring == UTF8.fromString "Accept" = HttpAccept
+  | bytestring == UTF8.fromString "Accept-Charset" = HttpAcceptCharset
+  | bytestring == UTF8.fromString "Accept-Encoding" = HttpAcceptEncoding
+  | bytestring == UTF8.fromString "Accept-Language" = HttpAcceptLanguage
+  | bytestring == UTF8.fromString "Authorization" = HttpAuthorization
+  | bytestring == UTF8.fromString "Expect" = HttpExpect
+  | bytestring == UTF8.fromString "From" = HttpFrom
+  | bytestring == UTF8.fromString "Host" = HttpHost
+  | bytestring == UTF8.fromString "If-Match" = HttpIfMatch
+  | bytestring == UTF8.fromString "If-Modified-Since" = HttpIfModifiedSince
+  | bytestring == UTF8.fromString "If-None-Match" = HttpIfNoneMatch
+  | bytestring == UTF8.fromString "If-Range" = HttpIfRange
+  | bytestring == UTF8.fromString "If-Unmodified-Since" = HttpIfUnmodifiedSince
+  | bytestring == UTF8.fromString "Max-Forwards" = HttpMaxForwards
+  | bytestring == UTF8.fromString "Proxy-Authorization" = HttpProxyAuthorization
+  | bytestring == UTF8.fromString "Range" = HttpRange
+  | bytestring == UTF8.fromString "Referer" = HttpReferer
+  | bytestring == UTF8.fromString "TE" = HttpTE
+  | bytestring == UTF8.fromString "User-Agent" = HttpUserAgent
+  | bytestring == UTF8.fromString "Accept-Ranges" = HttpAcceptRanges
+  | bytestring == UTF8.fromString "Age" = HttpAge
+  | bytestring == UTF8.fromString "ETag" = HttpETag
+  | bytestring == UTF8.fromString "Location" = HttpLocation
+  | bytestring == UTF8.fromString "Proxy-Authenticate" = HttpProxyAuthenticate
+  | bytestring == UTF8.fromString "Retry-After" = HttpRetryAfter
+  | bytestring == UTF8.fromString "Server" = HttpServer
+  | bytestring == UTF8.fromString "Vary" = HttpVary
+  | bytestring == UTF8.fromString "WWW-Authenticate" = HttpWWWAuthenticate
+  | bytestring == UTF8.fromString "Allow" = HttpAllow
+  | bytestring == UTF8.fromString "Content-Encoding" = HttpContentEncoding
+  | bytestring == UTF8.fromString "Content-Language" = HttpContentLanguage
+  | bytestring == UTF8.fromString "Content-Length" = HttpContentLength
+  | bytestring == UTF8.fromString "Content-Location" = HttpContentLocation
+  | bytestring == UTF8.fromString "Content-MD5" = HttpContentMD5
+  | bytestring == UTF8.fromString "Content-Range" = HttpContentRange
+  | bytestring == UTF8.fromString "Content-Type" = HttpContentType
+  | bytestring == UTF8.fromString "Expires" = HttpExpires
+  | bytestring == UTF8.fromString "Last-Modified" = HttpLastModified
+  | bytestring == UTF8.fromString "Connection" = HttpConnection
+  | bytestring == UTF8.fromString "Cookie" = HttpCookie
+  | bytestring == UTF8.fromString "Set-Cookie" = HttpSetCookie
+  | otherwise = HttpExtensionHeader bytestring
 
 
 requestVariableNameIsHeader :: String -> Bool
 requestVariableNameIsHeader name = (length name > 5) && (take 5 name == "HTTP_")
 
 
-requestVariableNameToHeaderName :: String -> Maybe String
+requestVariableNameToHeaderName :: String -> Maybe ByteString
 requestVariableNameToHeaderName name
     = if requestVariableNameIsHeader name
         then let split [] = []
@@ -914,7 +968,7 @@ requestVariableNameToHeaderName name
                                     in first : (split $ drop 1 rest)
                  titleCase word = [toUpper $ head word] ++ (map toLower $ tail word)
                  headerName = intercalate "-" $ map titleCase $ split $ drop 5 name
-             in Just headerName
+             in Just $ UTF8.fromString headerName
         else Nothing
 
 
@@ -1705,35 +1759,89 @@ seeOtherRedirect url = do
 sendResponseHeaders :: (MonadHTTP m) => m ()
 sendResponseHeaders = do
   requireOutputNotYetClosed
-  {-
-  HTTPState { request = Just request } <- getHTTPState
-  alreadySent <- liftIO $ takeMVar $ responseHeadersSentMVar request
+  HTTPState {
+      httpStateSocket = socket,
+      httpStateResponseHeadersSent = alreadySentMVar,
+      httpStateResponseStatus = responseStatusMVar,
+      httpStateResponseHeaderMap = responseHeaderMapMVar,
+      httpStateResponseCookieMap = responseCookieMapMVar
+    } <- getHTTPState
+  alreadySent <- liftIO $ takeMVar alreadySentMVar
   if not alreadySent
     then do
-      responseStatus <- liftIO $ readMVar $ responseStatusMVar request
-      responseHeaderMap <- liftIO $ readMVar $ responseHeaderMapMVar request
-      responseCookieMap <- liftIO $ readMVar $ responseCookieMapMVar request
-      let nameValuePairs = [("Status", (show responseStatus))]
-                           ++ (map (\key -> (fromHeader key,
-                                             fromJust $ Map.lookup key responseHeaderMap))
-                                   $ Map.keys responseHeaderMap)
-                           ++ (if (isNothing $ Map.lookup HttpSetCookie
-                                                          responseHeaderMap)
-                                  && (length (Map.elems responseCookieMap) > 0)
-                                 then [("Set-Cookie", setCookieValue)]
-                                 else [])
+      responseStatus <- liftIO $ readMVar responseStatusMVar
+      responseHeaderMap <- liftIO $ readMVar responseHeaderMapMVar
+      responseCookieMap <- liftIO $ readMVar responseCookieMapMVar
+      let statusLine = BS.concat [UTF8.fromString "HTTP/1.1 ",
+                                  UTF8.fromString $ show responseStatus,
+                                  UTF8.fromString " ",
+                                  reasonPhrase responseStatus,
+                                  UTF8.fromString "\r\n"]
+          nameValuePairs
+            = concat [map (\(header, value) -> (fromHeader header, value))
+                          $ Map.toList responseHeaderMap,
+                      if (isNothing $ Map.lookup HttpSetCookie responseHeaderMap)
+                         && (not $ Map.null responseCookieMap)
+                        then [(UTF8.fromString "Set-Cookie", setCookieValue)]
+                        else []]
           setCookieValue = printCookies $ Map.elems responseCookieMap
-          bytestrings
-              = (map (\(name, value) -> UTF8.fromString $ name ++ ": " ++ value ++ "\r\n")
-                     nameValuePairs)
-                ++ [UTF8.fromString "\r\n"]
-          buffer = foldl BS.append BS.empty bytestrings
-      sendBuffer buffer
+          delimiterLine = UTF8.fromString "\r\n"
+          buffer = BS.concat $ [statusLine]
+                               ++ (concat
+                                   $ map (\(name, value)
+                                            -> [name, UTF8.fromString ": ",
+                                                value, UTF8.fromString "\r\n"])
+                                         nameValuePairs)
+                               ++ [delimiterLine]
+      liftIO $ Network.sendAll socket buffer
     else return ()
-  liftIO $ putMVar (responseHeadersSentMVar request) True
-  -}
-  return ()
-  -- TODO
+  liftIO $ putMVar alreadySentMVar True
+
+
+reasonPhrase :: Int -> ByteString
+reasonPhrase status =
+  UTF8.fromString $ case status of
+                      100 -> "Continue"
+                      101 -> "Switching Protocols"
+                      200 -> "OK"
+                      201 -> "Created"
+                      202 -> "Accepted"
+                      203 -> "Non-Authoritative Information"
+                      204 -> "No Content"
+                      205 -> "Reset Content"
+                      206 -> "Partial Content"
+                      300 -> "Multiple Choices"
+                      301 -> "Moved Permanently"
+                      302 -> "Found"
+                      303 -> "See Other"
+                      304 -> "Not Modified"
+                      305 -> "Use Proxy"
+                      307 -> "Temporary Redirect"
+                      400 -> "Bad Request"
+                      401 -> "Unauthorized"
+                      402 -> "Payment Required"
+                      403 -> "Forbidden"
+                      404 -> "Not Found"
+                      405 -> "Method Not Allowed"
+                      406 -> "Not Acceptable"
+                      407 -> "Proxy Authentication Required"
+                      408 -> "Request Time-out"
+                      409 -> "Conflict"
+                      410 -> "Gone"
+                      411 -> "Length Required"
+                      412 -> "Precondition Failed"
+                      413 -> "Request Entity Too Large"
+                      414 -> "Request-URI Too Large"
+                      415 -> "Unsupported Media Type"
+                      416 -> "Requested range not satisfiable"
+                      417 -> "Expectation Failed"
+                      500 -> "Internal Server Error"
+                      501 -> "Not Implemented"
+                      502 -> "Bad Gateway"
+                      503 -> "Service Unavailable"
+                      504 -> "Gateway Time-out"
+                      505 -> "HTTP Version not supported"
+                      _ -> "Extension"
 
 
 -- | Returns whether the response headers have been sent.
