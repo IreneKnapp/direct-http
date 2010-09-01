@@ -144,6 +144,8 @@ import Data.List
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe
+import Data.Time
+import Data.Time.Clock.POSIX
 import Data.Typeable
 import Data.Word
 import Foreign.C.Error
@@ -155,6 +157,7 @@ import System.Environment
 import System.IO
 import System.IO.Error (ioeGetErrorType)
 import qualified System.IO.Error as System
+import System.Locale (defaultTimeLocale)
 
 
 -- | An opaque type representing the state of the HTTP server during a single
@@ -165,6 +168,7 @@ data HTTPState = HTTPState {
     httpStateSocket :: Network.Socket,
     httpStatePeer :: Network.SockAddr,
     httpStateInputBufferMVar :: MVar ByteString,
+    httpStateTimestamp :: MVar POSIXTime,
     httpStateQueryString :: MVar (Maybe String),
     httpStateRemoteHostname :: MVar (Maybe (Maybe String)),
     httpStateRequestMethod :: MVar String,
@@ -366,6 +370,7 @@ requestLoop inputBufferMVar
             peer
             fork
             handler = do
+  timestampMVar <- newEmptyMVar
   queryStringMVar <- newEmptyMVar
   remoteHostnameMVar <- newMVar Nothing
   requestMethodMVar <- newEmptyMVar
@@ -383,6 +388,7 @@ requestLoop inputBufferMVar
                 httpStateSocket = socket,
                 httpStatePeer = peer,
                 httpStateInputBufferMVar = inputBufferMVar,
+                httpStateTimestamp = timestampMVar,
                 httpStateQueryString = queryStringMVar,
                 httpStateRemoteHostname = remoteHostnameMVar,
                 httpStateRequestMethod = requestMethodMVar,
@@ -403,6 +409,8 @@ requestLoop inputBufferMVar
                                   return ())
       return ()
     Just (method, url, protocol, headers) -> do
+      timestamp <- liftIO $ getPOSIXTime
+      putMVar timestampMVar timestamp
       putMVar queryStringMVar Nothing -- TODO
       putMVar requestMethodMVar $ UTF8.toString method
       putMVar requestURIMVar $ UTF8.toString url
@@ -413,14 +421,22 @@ requestLoop inputBufferMVar
           (flip runReaderT state $ do
              valid <- getRequestValid
              if valid
-               then handler
-               else setResponseStatus 400
+               then do
+                 prepareResponse
+                 handler
+               else do
+                 setResponseStatus 400
              httpCloseOutput
              logAccess)
           (\error -> flip runReaderT state $ do
             httpLog $ "Uncaught exception: "
                       ++ (show (error :: Exception.SomeException))
-            httpCloseOutput)
+            alreadySent <- responseHeadersSent
+            if alreadySent
+              then return ()
+              else setResponseStatus 500
+            httpCloseOutput
+            logAccess)
         return ()
       requestLoop inputBufferMVar
                   accessLogMaybeHandleMVar
@@ -462,6 +478,16 @@ getRequestValid = do
       return $ and [headersValid, mandatoryHeadersIncluded, contentValid]
 
 
+prepareResponse :: HTTP ()
+prepareResponse = do
+  HTTPState { httpStateTimestamp = mvar } <- getHTTPState
+  timestamp <- liftIO $ readMVar mvar
+  let dateString = formatTime defaultTimeLocale
+                              "%a, %d %b %Y %H:%M:%S Z"
+                              $ posixSecondsToUTCTime timestamp
+  setResponseHeader HttpDate dateString
+
+
 logAccess :: HTTP ()
 logAccess = do
   maybePeerString <- getRemoteHost
@@ -474,7 +500,11 @@ logAccess = do
                   Just peerString -> return peerString
   identString <- return "-"
   usernameString <- return "-"
-  timestampString <- return "10/Oct/2000:13:55:36 -0700"
+  HTTPState { httpStateTimestamp = timestampMVar } <- getHTTPState
+  timestamp <- liftIO $ readMVar timestampMVar
+  let timestampString = formatTime defaultTimeLocale
+                                   "%-d/%b/%Y:%H:%M:%S %z"
+                                   $ posixSecondsToUTCTime timestamp
   methodString <- getRequestMethod >>= return . fromJust
   urlString <- getRequestURI >>= return . fromJust
   protocolString <- getRequestProtocol >>= return . fromJust
@@ -771,7 +801,16 @@ httpLog message = do
                     (\maybeHandle -> case maybeHandle of
                                        Nothing -> return ()
                                        Just handle -> do
-                                         hPutStrLn handle message
+                                         timestamp <- liftIO $ getPOSIXTime
+                                         let timestampString
+                                              = formatTime
+                                                 defaultTimeLocale
+                                                 "%Y-%m-%dT%H:%M:%SZ"
+                                                 $ posixSecondsToUTCTime
+                                                    timestamp
+                                         hPutStrLn handle
+                                                   $ timestampString ++ " "
+                                                     ++ message
                                          hFlush handle)
 
 
@@ -1598,8 +1637,8 @@ getResponseStatus = do
 -- | Sets the given 'HttpHeader' response header to the given string value, overriding
 --   any value which has previously been set.  If the response headers have already
 --   been sent, causes a 'ResponseHeadersAlreadySent' exception.  If the header is not
---   an HTTP/1.1 or extension response or entity header, ie, is not valid as part of
---   a response, causes a 'NotAResponseHeader' exception.
+--   an HTTP/1.1 or extension response, entity, or general header, ie, is not
+--   valid as part of a response, causes a 'NotAResponseHeader' exception.
 --   
 --   If a value is set for the 'HttpSetCookie' header, this overrides all cookies set
 --   for this request with 'setCookie'.
@@ -1612,15 +1651,11 @@ setResponseHeader header value = do
   requireResponseHeadersNotYetSent
   if isValidInResponse header
     then do
-      {-
-      HTTPState { request = Just request } <- getHTTPState
-      responseHeaderMap <- liftIO $ takeMVar $ responseHeaderMapMVar request
-      let responseHeaderMap' = Map.insert header value responseHeaderMap
-      liftIO $ putMVar (responseHeaderMapMVar request) responseHeaderMap'
-      -}
-      return ()
+      HTTPState { httpStateResponseHeaderMap = mvar } <- getHTTPState
+      headerMap <- liftIO $ takeMVar mvar
+      headerMap <- return $ Map.insert header (UTF8.fromString value) headerMap
+      liftIO $ putMVar mvar headerMap
     else httpThrow $ NotAResponseHeader header
-  -- TODO
 
 
 -- | Causes the given 'HttpHeader' response header not to be sent, overriding any value
@@ -1639,21 +1674,17 @@ unsetResponseHeader header = do
   requireResponseHeadersNotYetSent
   if isValidInResponse header
     then do
-      {-
-      HTTPState { request = Just request } <- getHTTPState
-      responseHeaderMap <- liftIO $ takeMVar $ responseHeaderMapMVar request
-      let responseHeaderMap' = Map.delete header responseHeaderMap
-      liftIO $ putMVar (responseHeaderMapMVar request) responseHeaderMap'
-      -}
-      return ()
+      HTTPState { httpStateResponseHeaderMap = mvar } <- getHTTPState
+      headerMap <- liftIO $ takeMVar mvar
+      headerMap <- return $ Map.delete header headerMap
+      liftIO $ putMVar mvar headerMap
     else httpThrow $ NotAResponseHeader header
-  -- TODO
 
 
 -- | Returns the value of the given header which will be or has been sent with the
---   response headers.  If the header is not an HTTP/1.1 or extension response or entity
---   header, ie, is not valid as part of a response, causes a 'NotAResponseHeader'
---   exception.
+--   response headers.  If the header is not an HTTP/1.1 or extension response,
+--   entity, or general header, ie, is not valid as part of a response, causes
+--   a 'NotAResponseHeader' exception.
 getResponseHeader
     :: (MonadHTTP m)
     => Header -- ^ The header to query.  Must be a response header or an entity
@@ -1663,14 +1694,10 @@ getResponseHeader header = do
   requireResponseHeadersNotYetSent
   if isValidInResponse header
     then do
-      {-
-      HTTPState { request = Just request } <- getHTTPState
-      responseHeaderMap <- liftIO $ readMVar $ responseHeaderMapMVar request
-      return $ Map.lookup header responseHeaderMap
-      -}
-      return Nothing
+      HTTPState { httpStateResponseHeaderMap = mvar } <- getHTTPState
+      headerMap <- liftIO $ readMVar mvar
+      return $ fmap UTF8.toString $ Map.lookup header headerMap
     else httpThrow $ NotAResponseHeader header
-  -- TODO
 
 
 -- | Causes the user agent to record the given cookie and send it back with future
@@ -1937,12 +1964,8 @@ reasonPhrase status =
 -- | Returns whether the response headers have been sent.
 responseHeadersSent :: (MonadHTTP m) => m Bool
 responseHeadersSent = do
-  {-
-  HTTPState { request = Just request } <- getHTTPState
-  liftIO $ readMVar $ responseHeadersSentMVar request
-  -}
-  return False
-  -- TODO
+  HTTPState { httpStateResponseHeadersSent = mvar } <- getHTTPState
+  liftIO $ readMVar mvar
 
 
 -- | Sends data.  This is the content data of the HTTP response.  If the response
@@ -1999,15 +2022,10 @@ terminateRequest = do
 
 requireResponseHeadersNotYetSent :: (MonadHTTP m) => m ()
 requireResponseHeadersNotYetSent = do
-  {-
-  HTTPState { request = Just request } <- getHTTPState
-  alreadySent <- liftIO $ readMVar $ responseHeadersSentMVar request
+  alreadySent <- responseHeadersSent
   if alreadySent
     then httpThrow ResponseHeadersAlreadySent
     else return ()
-   -}
-  return ()
-  -- TODO
 
 
 requireOutputNotYetClosed :: (MonadHTTP m) => m ()
