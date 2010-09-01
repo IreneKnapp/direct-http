@@ -170,6 +170,7 @@ data HTTPState = HTTPState {
     httpStateRequestMethod :: MVar String,
     httpStateRequestURI :: MVar String,
     httpStateRequestProtocol :: MVar String,
+    httpStateRequestHeaderMap :: MVar (Map Header ByteString),
     httpStateResponseHeadersSent :: MVar Bool,
     httpStateResponseStatus :: MVar Int,
     httpStateResponseHeaderMap :: MVar (Map Header ByteString),
@@ -322,7 +323,9 @@ acceptLoop parameters fork handler = do
     else return ()
   let acceptLoop' = do
         (socket, peer) <- Network.accept listenSocket
-        requestLoop accessLogMaybeHandleMVar
+        inputBufferMVar <- newMVar BS.empty
+        requestLoop inputBufferMVar
+                    accessLogMaybeHandleMVar
                     errorLogMaybeHandleMVar
                     socket
                     peer
@@ -345,27 +348,30 @@ createListenSocket = do
 daemonize :: IO ()
 daemonize = do
   putStrLn $ "Pretend-daemonizing."
+  -- TODO
 
 
-requestLoop :: MVar (Maybe Handle)
+requestLoop :: MVar ByteString
+            -> MVar (Maybe Handle)
             -> MVar (Maybe Handle)
             -> Network.Socket
             -> Network.SockAddr
             -> (IO () -> IO ThreadId)
             -> HTTP ()
             -> IO ()
-requestLoop accessLogMaybeHandleMVar
+requestLoop inputBufferMVar
+            accessLogMaybeHandleMVar
             errorLogMaybeHandleMVar
             socket
             peer
             fork
             handler = do
-  inputBufferMVar <- newMVar $ BS.empty
   queryStringMVar <- newEmptyMVar
   remoteHostnameMVar <- newMVar Nothing
   requestMethodMVar <- newEmptyMVar
   requestURIMVar <- newEmptyMVar
   requestProtocolMVar <- newEmptyMVar
+  requestHeaderMapMVar <- newEmptyMVar
   responseHeadersSentMVar <- newMVar $ False
   responseStatusMVar <- newMVar $ 200
   responseHeaderMapMVar <- newMVar $ Map.fromList
@@ -382,6 +388,7 @@ requestLoop accessLogMaybeHandleMVar
                 httpStateRequestMethod = requestMethodMVar,
                 httpStateRequestURI = requestURIMVar,
                 httpStateRequestProtocol = requestProtocolMVar,
+                httpStateRequestHeaderMap = requestHeaderMapMVar,
                 httpStateResponseHeadersSent = responseHeadersSentMVar,
                 httpStateResponseStatus = responseStatusMVar,
                 httpStateResponseHeaderMap = responseHeaderMapMVar,
@@ -400,10 +407,14 @@ requestLoop accessLogMaybeHandleMVar
       putMVar requestMethodMVar $ UTF8.toString method
       putMVar requestURIMVar $ UTF8.toString url
       putMVar requestProtocolMVar $ UTF8.toString protocol
+      putMVar requestHeaderMapMVar headers
       fork $ do
         Exception.catch
           (flip runReaderT state $ do
-             handler
+             valid <- getRequestValid
+             if valid
+               then handler
+               else setResponseStatus 400
              httpCloseOutput
              logAccess)
           (\error -> flip runReaderT state $ do
@@ -411,12 +422,44 @@ requestLoop accessLogMaybeHandleMVar
                       ++ (show (error :: Exception.SomeException))
             httpCloseOutput)
         return ()
-      requestLoop accessLogMaybeHandleMVar
+      requestLoop inputBufferMVar
+                  accessLogMaybeHandleMVar
                   errorLogMaybeHandleMVar
                   socket
                   peer
                   fork
                   handler
+
+
+getRequestValid :: HTTP Bool
+getRequestValid = do
+  hasContent <- getRequestHasContent
+  httpLog $ "has content: " ++ show hasContent
+  let getHeadersValid = do
+        HTTPState { httpStateRequestHeaderMap = mvar } <- getHTTPState
+        headerMap <- liftIO $ readMVar mvar
+        return $ all (\header -> (isValidInRequest header)
+                                 && (hasContent
+                                     || (not $ isValidOnlyWithEntity header)))
+                     $ Map.keys headerMap
+      getContentValid = do
+        contentAllowed <- getRequestContentAllowed
+        return $ contentAllowed || not hasContent
+  httpVersion <- getRequestProtocol >>= return . fromJust
+  case httpVersion of
+    "HTTP/1.0" -> do
+      headersValid <- getHeadersValid
+      contentValid <- getContentValid
+      return $ and [headersValid, contentValid]
+    "HTTP/1.1" -> do
+      headersValid <- getHeadersValid
+      contentValid <- getContentValid
+      mandatoryHeadersIncluded <- do
+        maybeHost <- getRequestHeader HttpHost
+        case maybeHost of
+          Nothing -> return False
+          Just host -> return True
+      return $ and [headersValid, mandatoryHeadersIncluded, contentValid]
 
 
 logAccess :: HTTP ()
@@ -434,10 +477,9 @@ logAccess = do
   timestampString <- return "10/Oct/2000:13:55:36 -0700"
   methodString <- getRequestMethod >>= return . fromJust
   urlString <- getRequestURI >>= return . fromJust
-  HTTPState { httpStateRequestProtocol = protocolMVar } <- getHTTPState
-  protocolString <- liftIO $ readMVar protocolMVar
-  responseCodeString <- return $ show 200
-  maybeResponseSize <- return Nothing :: HTTP (Maybe Int)
+  protocolString <- getRequestProtocol >>= return . fromJust
+  responseStatusString <- getResponseStatus >>= return . show
+  maybeResponseSize <- return Nothing :: HTTP (Maybe Int) -- TODO
   responseSizeString
     <- case maybeResponseSize of
          Nothing -> return "-"
@@ -458,7 +500,7 @@ logAccess = do
                   ++ " "
                   ++ protocolString
                   ++ "\" "
-                  ++ responseCodeString
+                  ++ responseStatusString
                   ++ " "
                   ++ responseSizeString
                   ++ " \""
@@ -583,7 +625,7 @@ printCookies cookies =
 
 parseInt :: String -> Maybe Int
 parseInt string =
-    if (length string > 0) && (all isDigit string)
+    if (not $ null string) && (all isDigit string)
       then Just $ let accumulate "" accumulator = accumulator
                       accumulate (n:rest) accumulator
                                  = accumulate rest $ accumulator * 10 + digitToInt n
@@ -691,7 +733,7 @@ recvLine :: ByteString -> HTTP (ByteString, Maybe ByteString)
 recvLine inputBuffer = do
   let loop inputBuffer length = do
         (inputBuffer, endOfInput)
-          <- singleAttemptExtendInputBuffer inputBuffer length
+          <- extendInputBuffer inputBuffer length False
         let (before, after)
               = BS.breakSubstring (UTF8.fromString "\r\n") inputBuffer
         if BS.null after
@@ -705,20 +747,8 @@ recvLine inputBuffer = do
   loop inputBuffer 80
 
 
-singleAttemptExtendInputBuffer :: ByteString -> Int -> HTTP (ByteString, Bool)
-singleAttemptExtendInputBuffer inputBuffer length = do
-  HTTPState { httpStateSocket = socket } <- getHTTPState
-  if BS.length inputBuffer < length
-    then do
-      newInput <- liftIO $ Network.recv socket 4096
-      if BS.null newInput
-        then return (inputBuffer, True)
-        else return (BS.append inputBuffer newInput, False)
-    else return (inputBuffer, False)
-
-
-extendInputBuffer :: ByteString -> Int -> HTTP (ByteString, Bool)
-extendInputBuffer inputBuffer length = do
+extendInputBuffer :: ByteString -> Int -> Bool -> HTTP (ByteString, Bool)
+extendInputBuffer inputBuffer length blocking = do
   HTTPState { httpStateSocket = socket } <- getHTTPState
   let loop inputBuffer = do
         if BS.length inputBuffer < length
@@ -726,7 +756,9 @@ extendInputBuffer inputBuffer length = do
             newInput <- liftIO $ Network.recv socket 4096
             if BS.null newInput
               then return (inputBuffer, True)
-              else loop $ BS.append inputBuffer newInput
+              else if blocking
+                     then loop $ BS.append inputBuffer newInput
+                     else return (BS.append inputBuffer newInput, False)
           else return (inputBuffer, False)
   loop inputBuffer
 
@@ -755,8 +787,8 @@ httpAccessLog message = do
                                          hFlush handle)
 
 
--- | Headers are classified by HTTP/1.1 as request headers, response headers, or
---   entity headers.
+-- | Headers are classified by HTTP/1.1 as request headers, response headers,
+--   entity headers, or general headers.
 data Header
     -- | Request headers
     = HttpAccept
@@ -800,8 +832,17 @@ data Header
     | HttpExpires
     | HttpLastModified
     | HttpExtensionHeader ByteString
-    -- | Nonstandard headers
+    -- | General headers
+    | HttpCacheControl
     | HttpConnection
+    | HttpDate
+    | HttpPragma
+    | HttpTrailer
+    | HttpTransferEncoding
+    | HttpUpgrade
+    | HttpVia
+    | HttpWarning
+    -- | Nonstandard headers
     | HttpCookie
     | HttpSetCookie
       deriving (Eq, Ord)
@@ -814,6 +855,7 @@ instance Show Header where
 data HeaderType = RequestHeader
                 | ResponseHeader
                 | EntityHeader
+                | GeneralHeader
                   deriving (Eq, Show)
 
 
@@ -857,7 +899,15 @@ headerType HttpContentType = EntityHeader
 headerType HttpExpires = EntityHeader
 headerType HttpLastModified = EntityHeader
 headerType (HttpExtensionHeader _) = EntityHeader
-headerType HttpConnection = RequestHeader
+headerType HttpCacheControl = GeneralHeader
+headerType HttpConnection = GeneralHeader
+headerType HttpDate = GeneralHeader
+headerType HttpPragma = GeneralHeader
+headerType HttpTrailer = GeneralHeader
+headerType HttpTransferEncoding = GeneralHeader
+headerType HttpUpgrade = GeneralHeader
+headerType HttpVia = GeneralHeader
+headerType HttpWarning = GeneralHeader
 headerType HttpCookie = RequestHeader
 headerType HttpSetCookie = ResponseHeader
 
@@ -902,7 +952,15 @@ fromHeader HttpContentType = UTF8.fromString "Content-Type"
 fromHeader HttpExpires = UTF8.fromString "Expires"
 fromHeader HttpLastModified = UTF8.fromString "Last-Modified"
 fromHeader (HttpExtensionHeader name) = name
+fromHeader HttpCacheControl = UTF8.fromString "Cache-Control"
 fromHeader HttpConnection = UTF8.fromString "Connection"
+fromHeader HttpDate = UTF8.fromString "Date"
+fromHeader HttpPragma = UTF8.fromString "Pragma"
+fromHeader HttpTrailer = UTF8.fromString "Trailer"
+fromHeader HttpTransferEncoding = UTF8.fromString "Transfer-Encoding"
+fromHeader HttpUpgrade = UTF8.fromString "Upgrade"
+fromHeader HttpVia = UTF8.fromString "Via"
+fromHeader HttpWarning = UTF8.fromString "Warning"
 fromHeader HttpCookie = UTF8.fromString "Cookie"
 fromHeader HttpSetCookie = UTF8.fromString "Set-Cookie"
 
@@ -947,7 +1005,15 @@ toHeader bytestring
   | bytestring == UTF8.fromString "Content-Type" = HttpContentType
   | bytestring == UTF8.fromString "Expires" = HttpExpires
   | bytestring == UTF8.fromString "Last-Modified" = HttpLastModified
+  | bytestring == UTF8.fromString "Cache-Control" = HttpCacheControl
   | bytestring == UTF8.fromString "Connection" = HttpConnection
+  | bytestring == UTF8.fromString "Date" = HttpDate
+  | bytestring == UTF8.fromString "Pragma" = HttpPragma
+  | bytestring == UTF8.fromString "Trailer" = HttpTrailer
+  | bytestring == UTF8.fromString "Transfer-Encoding" = HttpTransferEncoding
+  | bytestring == UTF8.fromString "Upgrade" = HttpUpgrade
+  | bytestring == UTF8.fromString "Via" = HttpVia
+  | bytestring == UTF8.fromString "Warning" = HttpWarning
   | bytestring == UTF8.fromString "Cookie" = HttpCookie
   | bytestring == UTF8.fromString "Set-Cookie" = HttpSetCookie
   | otherwise = HttpExtensionHeader bytestring
@@ -1002,7 +1068,15 @@ requestVariableNameToHeader "HTTP_CONTENT_RANGE" = Just HttpContentRange
 requestVariableNameToHeader "HTTP_CONTENT_TYPE" = Just HttpContentType
 requestVariableNameToHeader "HTTP_EXPIRES" = Just HttpExpires
 requestVariableNameToHeader "HTTP_LAST_MODIFIED" = Just HttpLastModified
+requestVariableNameToHeader "HTTP_CACHE_CONTROL" = Just HttpCacheControl
 requestVariableNameToHeader "HTTP_CONNECTION" = Just HttpConnection
+requestVariableNameToHeader "HTTP_DATE" = Just HttpDate
+requestVariableNameToHeader "HTTP_PRAGMA" = Just HttpPragma
+requestVariableNameToHeader "HTTP_TRAILER" = Just HttpTrailer
+requestVariableNameToHeader "HTTP_TRANSFER_ENCODING" = Just HttpTransferEncoding
+requestVariableNameToHeader "HTTP_UPGRADE" = Just HttpUpgrade
+requestVariableNameToHeader "HTTP_VIA" = Just HttpVia
+requestVariableNameToHeader "HTTP_WARNING" = Just HttpWarning
 requestVariableNameToHeader "HTTP_COOKIE" = Just HttpCookie
 requestVariableNameToHeader name
     = if requestVariableNameIsHeader name
@@ -1010,19 +1084,29 @@ requestVariableNameToHeader name
         else Nothing
 
 
+isValidInRequest :: Header -> Bool
+isValidInRequest header = (headerType header == RequestHeader)
+                          || (headerType header == EntityHeader)
+                          || (headerType header == GeneralHeader)
+
+
 isValidInResponse :: Header -> Bool
 isValidInResponse header = (headerType header == ResponseHeader)
                            || (headerType header == EntityHeader)
+                           || (headerType header == GeneralHeader)
 
 
--- | Queries the value from the web server of the CGI/1.1 request variable with the
+isValidOnlyWithEntity :: Header -> Bool
+isValidOnlyWithEntity header = headerType header == EntityHeader
+
+
+-- | Queries the value of the CGI/1.1 request variable with the
 --   given name for this request.  This interface is provided as a convenience to
 --   programs which were originally written against the CGI or FastCGI APIs.
 getRequestVariable
     :: (MonadHTTP m)
     => String -- ^ The name of the request variable to query.
-    -> m (Maybe String) -- ^ The value of the request variable, if the web server
-                        --   provided one.
+    -> m (Maybe String) -- ^ The value of the request variable.
 getRequestVariable "DOCUMENT_ROOT" = getDocumentRoot
 getRequestVariable "GATEWAY_INTERFACE" = getGatewayInterface
 getRequestVariable "PATH_INFO" = getPathInfo
@@ -1075,7 +1159,10 @@ getRequestVariable "CONTENT_LENGTH" = do
     Nothing -> return Nothing
     Just result -> return $ Just $ show result
 getRequestVariable "CONTENT_TYPE" = getContentType
-getRequestVariable _ = return Nothing
+getRequestVariable string
+  | requestVariableNameIsHeader string
+    = getRequestHeader $ fromJust $ requestVariableNameToHeader string
+  | otherwise = return Nothing
 
 
 -- | Returns an association list of name-value pairs of all the CGI/1.1 request
@@ -1099,7 +1186,21 @@ getAllRequestVariables = do
              "REMOTE_IDENT", "REMOTE_USER", "REQUEST_METHOD", "REQUEST_URI",
              "SCRIPT_FILENAME", "SCRIPT_NAME", "SERVER_ADDR", "SERVER_NAME",
              "SERVER_PORT", "SERVER_PROTOCOL", "SERVER_SOFTWARE", "AUTH_TYPE",
-             "CONTENT_LENGTH", "CONTENT_TYPE"]
+             "CONTENT_LENGTH", "CONTENT_TYPE", "HTTP_ACCEPT",
+             "HTTP_ACCEPT_CHARSET", "HTTP_ACCEPT_ENCODING",
+             "HTTP_ACCEPT_LANGUAGE", "HTTP_AUTHORIZATION", "HTTP_EXPECT",
+             "HTTP_FROM", "HTTP_HOST", "HTTP_IF_MATCH",
+             "HTTP_IF_MODIFIED_SINCE", "HTTP_IF_NONE_MATCH", "HTTP_IF_RANGE",
+             "HTTP_IF_UNMODIFIED_SINCE", "HTTP_MAX_FORWARDS",
+             "HTTP_PROXY_AUTHORIZATION", "HTTP_RANGE", "HTTP_REFERER",
+             "HTTP_TE", "HTTP_USER_AGENT", "HTTP_ALLOW",
+             "HTTP_CONTENT_ENCODING", "HTTP_CONTENT_LANGUAGE",
+             "HTTP_CONTENT_LENGTH", "HTTP_CONTENT_LOCATION",
+             "HTTP_CONTENT_MD5", "HTTP_CONTENT_RANGE", "HTTP_CONTENT_TYPE",
+             "HTTP_EXPIRES", "HTTP_LAST_MODIFIED", "HTTP_CACHE_CONTROL",
+             "HTTP_CONNECTION", "HTTP_DATE", "HTTP_PRAGMA", "HTTP_TRAILER",
+             "HTTP_TRANSFER_ENCODING", "HTTP_UPGRADE", "HTTP_VIA",
+             "HTTP_WARNING", "HTTP_COOKIE"]
   return $ map fromJust $ filter isJust result
 
 
@@ -1109,16 +1210,19 @@ getRequestHeader
     => Header -- ^ The header to query.  Must be a request or entity header.
     -> m (Maybe String) -- ^ The value of the header, if the user agent provided one.
 getRequestHeader header = do
-  return Nothing
-  -- TODO
+  HTTPState { httpStateRequestHeaderMap = mvar } <- getHTTPState
+  headerMap <- liftIO $ readMVar mvar
+  return $ fmap UTF8.toString $ Map.lookup header headerMap
 
 
 -- | Returns an association list of name-value pairs of all the HTTP/1.1 request or
 --   entity headers from the user agent.
 getAllRequestHeaders :: (MonadHTTP m) => m [(Header, String)]
 getAllRequestHeaders = do
-  return []
-  -- TODO
+  HTTPState { httpStateRequestHeaderMap = mvar } <- getHTTPState
+  headerMap <- liftIO $ readMVar mvar
+  return $ map (\(header, bytestring) -> (header, UTF8.toString bytestring))
+               $ Map.toList headerMap
 
 
 -- | Returns a 'Cookie' object for the given name, if the user agent provided one
@@ -1279,6 +1383,12 @@ getRequestURI = do
   liftIO $ readMVar mvar >>= return . Just
 
 
+getRequestProtocol :: (MonadHTTP m) => m (Maybe String)
+getRequestProtocol = do
+  HTTPState { httpStateRequestProtocol = protocolMVar } <- getHTTPState
+  liftIO $ readMVar protocolMVar >>= return . Just
+
+
 -- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
 --   the corresponding function would return the script filename.
 getScriptFilename :: (MonadHTTP m) => m (Maybe String)
@@ -1334,18 +1444,45 @@ getAuthenticationType = do
   -- TODO
 
 
--- | Return the content length.
+-- | Return the request content length, if this is knowable without actually
+--   receiving the content - in particular, if the Content-Length header was
+--   used.  Otherwise, returns Nothing.
 getContentLength :: (MonadHTTP m) => m (Maybe Int)
 getContentLength = do
-  return Nothing
-  -- TODO
+  maybeString <- getRequestHeader HttpContentLength
+  case maybeString of
+    Nothing -> return Nothing
+    Just string -> return $ parseInt string
 
 
--- | Return the content type.
+-- | Return the request content type, as provided by the user agent.
 getContentType :: (MonadHTTP m) => m (Maybe String)
 getContentType = do
-  return Nothing
-  -- TODO
+  getRequestHeader HttpContentType
+
+
+getRequestHasContent :: (MonadHTTP m) => m Bool
+getRequestHasContent = do
+  maybeLengthString <- getRequestHeader HttpContentLength
+  maybeTransferEncodingString <- getRequestHeader HttpTransferEncoding
+  case (maybeLengthString, maybeTransferEncodingString) of
+    (Nothing, Nothing) -> return False
+    _ -> return True
+
+
+getRequestContentAllowed :: (MonadHTTP m) => m Bool
+getRequestContentAllowed = do
+  Just method <- getRequestMethod
+  case method of
+    _ | method == "OPTIONS" -> return True
+      | method == "GET" -> return False
+      | method == "HEAD" -> return False
+      | method == "POST" -> return True
+      | method == "PUT" -> return True
+      | method == "DELETE" -> return False
+      | method == "TRACE" -> return False
+      | method == "CONNECT" -> return True
+      | otherwise -> return True
 
 
 -- | Reads up to a specified amount of data from the input stream of the current request,
@@ -1433,46 +1570,6 @@ httpIsReadable = do
   -- TODO
 
 
-extendStdinStreamBufferToLength :: (MonadHTTP m) => Int -> Bool -> m ()
-extendStdinStreamBufferToLength desiredLength nonBlocking = do
-  {-
-  HTTPState { request = Just request } <- getHTTPState
-  stdinStreamBuffer <- liftIO $ takeMVar $ stdinStreamBufferMVar request
-  let extend bufferSoFar = do
-        if BS.length bufferSoFar >= desiredLength
-          then liftIO $ putMVar (stdinStreamBufferMVar request) bufferSoFar
-          else do
-            maybeRecord <- if nonBlocking
-                             then do
-                               isEmpty <- liftIO $ isEmptyChan $ requestChannel request
-                               if isEmpty
-                                 then return Nothing
-                                 else do
-                                   record <- liftIO $ readChan $ requestChannel request
-                                   return $ Just record
-                             else do
-                               record <- liftIO $ readChan $ requestChannel request
-                               return $ Just record
-            case maybeRecord of
-              Nothing -> liftIO $ putMVar (stdinStreamBufferMVar request) bufferSoFar
-              Just record
-                -> case recordType record of
-                     StdinRecord -> do
-                       case BS.length $ recordContent record of
-                         0 -> do
-                           liftIO $ swapMVar (stdinStreamClosedMVar request) True
-                           liftIO $ putMVar (stdinStreamBufferMVar request) bufferSoFar
-                         _ -> do
-                           extend $ BS.append bufferSoFar $ recordContent record
-                     _ -> do
-                       httpLog $ "Ignoring record of unexpected type "
-                              ++ (show $ recordType record)
-  extend stdinStreamBuffer
-  -}
-  return ()
-  -- TODO
-
-
 -- | Sets the response status which will be sent with the response headers.  If the
 --   response headers have already been sent, causes a 'ResponseHeadersAlreadySent'
 --   exception.
@@ -1482,12 +1579,9 @@ setResponseStatus
     -> m ()
 setResponseStatus status = do
   requireResponseHeadersNotYetSent
-  {-
-  HTTPState { request = Just request } <- getHTTPState
-  liftIO $ swapMVar (responseStatusMVar request) status
-  -}
+  HTTPState { httpStateResponseStatus = mvar } <- getHTTPState
+  liftIO $ swapMVar mvar status
   return ()
-  -- TODO
       
 
 
@@ -1497,12 +1591,8 @@ getResponseStatus
     :: (MonadHTTP m)
     => m Int -- ^ The HTTP/1.1 status code.
 getResponseStatus = do
-  {-
-  HTTPState { request = Just request } <- getHTTPState
-  liftIO $ readMVar (responseStatusMVar request)
-  -}
-  return 200
-  -- TODO
+  HTTPState { httpStateResponseStatus = mvar } <- getHTTPState
+  liftIO $ readMVar mvar
 
 
 -- | Sets the given 'HttpHeader' response header to the given string value, overriding
