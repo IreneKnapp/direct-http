@@ -27,4 +27,7 @@ Library
                  network-bytestring >= 0.1.2.1 && < 1,
                  utf8-string >= 0.3.6 && < 1,
                  time >= 1.1.4,
-                 old-locale >= 1.0.0.2
+                 old-locale >= 1.0.0.2,
+                 unix >= 2.4.0.1,
+                 
+                 direct-daemonize >= 1.0

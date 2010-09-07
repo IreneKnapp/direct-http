@@ -12,6 +12,8 @@ main = do
                  serverParametersAccessLogPath = Just "access.log",
                  serverParametersErrorLogPath = Just "error.log",
                  serverParametersDaemonize = True,
+                 serverParametersUserToChangeTo = Just "dankna",
+                 serverParametersGroupToChangeTo = Just "dankna",
                  serverParametersNames
                    = [(["dankna.com", "localhost"],
                        [(loopbackAddress, 80, False),

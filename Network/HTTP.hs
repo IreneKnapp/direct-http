@@ -153,11 +153,14 @@ import GHC.IO.Exception (IOErrorType(..))
 import qualified Network.Socket as Network hiding (send, sendTo, recv, recvFrom)
 import qualified Network.Socket.ByteString as Network
 import Prelude hiding (catch)
+import System.Daemonize
 import System.Environment
+import System.Exit
 import System.IO
 import System.IO.Error (ioeGetErrorType)
 import qualified System.IO.Error as System
 import System.Locale (defaultTimeLocale)
+import qualified System.Posix as POSIX
 
 
 -- | An opaque type representing the state of the HTTP server during a single
@@ -165,20 +168,25 @@ import System.Locale (defaultTimeLocale)
 data HTTPState = HTTPState {
     httpStateAccessLogMaybeHandleMVar :: MVar (Maybe Handle),
     httpStateErrorLogMaybeHandleMVar :: MVar (Maybe Handle),
-    httpStateSocket :: Network.Socket,
-    httpStatePeer :: Network.SockAddr,
-    httpStateInputBufferMVar :: MVar ByteString,
-    httpStateTimestamp :: MVar POSIXTime,
-    httpStateQueryString :: MVar (Maybe String),
-    httpStateRemoteHostname :: MVar (Maybe (Maybe String)),
-    httpStateRequestMethod :: MVar String,
-    httpStateRequestURI :: MVar String,
-    httpStateRequestProtocol :: MVar String,
-    httpStateRequestHeaderMap :: MVar (Map Header ByteString),
-    httpStateResponseHeadersSent :: MVar Bool,
-    httpStateResponseStatus :: MVar Int,
-    httpStateResponseHeaderMap :: MVar (Map Header ByteString),
-    httpStateResponseCookieMap :: MVar (Map String Cookie)
+    httpStateMaybeConnection :: Maybe HTTPConnection
+  }
+
+
+data HTTPConnection = HTTPConnection {
+    httpConnectionSocket :: Network.Socket,
+    httpConnectionPeer :: Network.SockAddr,
+    httpConnectionInputBufferMVar :: MVar ByteString,
+    httpConnectionTimestamp :: MVar POSIXTime,
+    httpConnectionQueryString :: MVar (Maybe String),
+    httpConnectionRemoteHostname :: MVar (Maybe (Maybe String)),
+    httpConnectionRequestMethod :: MVar String,
+    httpConnectionRequestURI :: MVar String,
+    httpConnectionRequestProtocol :: MVar String,
+    httpConnectionRequestHeaderMap :: MVar (Map Header ByteString),
+    httpConnectionResponseHeadersSent :: MVar Bool,
+    httpConnectionResponseStatus :: MVar Int,
+    httpConnectionResponseHeaderMap :: MVar (Map Header ByteString),
+    httpConnectionResponseCookieMap :: MVar (Map String Cookie)
   }
 
 
@@ -253,6 +261,12 @@ instance MonadHTTP HTTP where
       liftIO $ Exception.unblock (runReaderT action state)
 
 
+getHTTPConnection :: (MonadHTTP m) => m HTTPConnection
+getHTTPConnection = do
+  HTTPState { httpStateMaybeConnection = maybeConnection } <- getHTTPState
+  return $ fromJust maybeConnection
+
+
 -- | A record used to configure the server.  Contains optional paths to files
 --   for the access and error logs (if these are omitted, logging is not done),
 --   and a flag indicating whether to run as a daemon.  Also contains the names
@@ -265,6 +279,8 @@ data HTTPServerParameters = HTTPServerParameters {
     serverParametersAccessLogPath :: Maybe FilePath,
     serverParametersErrorLogPath :: Maybe FilePath,
     serverParametersDaemonize :: Bool,
+    serverParametersUserToChangeTo :: Maybe String,
+    serverParametersGroupToChangeTo :: Maybe String,
     serverParametersNames :: [([Network.HostName],
                                [(Network.HostAddress,
                                  Network.PortNumber,
@@ -272,33 +288,36 @@ data HTTPServerParameters = HTTPServerParameters {
   }
 
 
--- | Takes a forking primitive, such as 'forkIO' or 'forkOS', and a handler, and
---   concurrently accepts requests from the web server, forking with the primitive
---   and invoking the handler in the forked thread inside the 'HTTP' monad for each
---   one.
+-- | Takes a server parameters record, a forking primitive such as 'forkIO'
+--   or 'forkOS', and a handler, and concurrently accepts requests from user
+--   agents, forking with the primitive and invoking the handler in the forked
+--   thread inside the 'HTTP' monad for each one.
 --   
---   If the access logfile path is not Nothing, opens this logfile in append mode
---   and uses it to log all accesses; otherwise, access is not logged.
+--   If the access logfile path is not Nothing, opens this logfile in append
+--   mode and uses it to log all accesses; otherwise, access is not logged.
 --   
 --   If the error logfile path is not Nothing, opens this logfile in append mode
---   and uses it to log all errors; otherwise, if not daemonizing, errors are logged
---   to standard output; if daemonizing, errors are not logged.
+--   and uses it to log all errors; otherwise, if not daemonizing, errors are
+--   logged to standard output; if daemonizing, errors are not logged.
 --   
 --   If the daemonize flag is True, closes the standard IO streams and moves
---   the process into the background, doing all the usual Unix things to make it run
---   as a daemon henceforth.  This is optional because it might be useful to turn it
---   off for debugging purposes.
+--   the process into the background, doing all the usual Unix things to make it
+--   run as a daemon henceforth.  This is optional because it might be useful to
+--   turn it off for debugging purposes.
 --   
---   It is valid to use a custom forking primitive, such as one that attempts to pool
---   OS threads, but the primitive must actually provide concurrency - otherwise there
---   will be a deadlock.  There is no support for single-threaded operation.
+--   It is valid to use a custom forking primitive, such as one that attempts to
+--   pool OS threads, but the primitive must actually provide concurrency -
+--   otherwise there will be a deadlock.  There is no support for
+--   single-threaded operation.
 --   
---   Note that although there is no mechanism to substitute another type of monad for
---   HTTP, you can enter your own monad within the handler, much as you would enter
---   your own monad within IO.  You simply have to implement the 'MonadHTTP' class.
+--   Note that although there is no mechanism to substitute another type of
+--   monad for HTTP, you can enter your own monad within the handler, much as
+--   you would enter your own monad within IO.  You simply have to implement
+--   the 'MonadHTTP' class.
 --   
---   Any exceptions not caught within the handler are caught by 'concurrentAcceptLoop',
---   and cause the termination of that handler, but not of the accept loop.
+--   Any exceptions not caught within the handler are caught by
+--   'acceptLoop', and cause the termination of that handler, but not
+--   of the connection or the accept loop.
 acceptLoop
     :: HTTPServerParameters
     -- ^ Parameters describing the behavior of the server to run.
@@ -309,34 +328,74 @@ acceptLoop
     -> IO ()
     -- ^ Never actually returns.
 acceptLoop parameters fork handler = do
-  listenSocket <- createListenSocket
-  accessLogMaybeHandle <- case serverParametersAccessLogPath parameters of
-                            Nothing -> return Nothing
-                            Just path -> openBinaryFile path AppendMode
-                                         >>= return . Just
+  (listenSocket, accessLogMaybeHandle, errorLogMaybeHandle)
+    <- Exception.catch
+       (do
+         listenSocket <- createListenSocket
+         accessLogMaybeHandle
+           <- case serverParametersAccessLogPath parameters of
+                Nothing -> return Nothing
+                Just path -> openBinaryFile path AppendMode
+                             >>= return . Just
+         errorLogMaybeHandle
+           <- case serverParametersErrorLogPath parameters of
+                Nothing -> if serverParametersDaemonize parameters
+                             then return Nothing
+                             else return $ Just stdout
+                Just path -> openBinaryFile path AppendMode
+                             >>= return . Just
+         return (listenSocket, accessLogMaybeHandle, errorLogMaybeHandle))
+        (\e -> do
+           hPutStrLn stderr
+                     $ "Failed to start: "
+                       ++ (show (e :: Exception.SomeException))
+           exitFailure)
   accessLogMaybeHandleMVar <- newMVar accessLogMaybeHandle
-  errorLogMaybeHandle <- case serverParametersErrorLogPath parameters of
-                           Nothing -> if serverParametersDaemonize parameters
-                                        then return Nothing
-                                        else return $ Just stdout
-                           Just path -> openBinaryFile path AppendMode
-                                        >>= return . Just
   errorLogMaybeHandleMVar <- newMVar errorLogMaybeHandle
   if serverParametersDaemonize parameters
-    then daemonize
+    then do
+      let maybeHandleMVarToFd maybeHandleMVar = do
+            maybeHandle <- takeMVar maybeHandleMVar
+            case maybeHandle of
+              Nothing -> do
+                putMVar maybeHandleMVar Nothing
+                return Nothing
+              Just handle -> do
+                fd <- POSIX.handleToFd handle
+                handle <- POSIX.fdToHandle fd
+                putMVar maybeHandleMVar $ Just handle
+                return $ Just fd
+      accessLogMaybeFd <- maybeHandleMVarToFd accessLogMaybeHandleMVar
+      errorLogMaybeFd <- maybeHandleMVarToFd errorLogMaybeHandleMVar
+      listenSocketMaybeFd <- return $ Just
+                                    $ POSIX.Fd $ Network.fdSocket listenSocket
+      daemonize $ defaultDaemonOptions {
+                    daemonFileDescriptorsToLeaveOpen
+                      = (map fromJust $ filter isJust [accessLogMaybeFd,
+                                                       errorLogMaybeFd,
+                                                       listenSocketMaybeFd]),
+                    daemonUserToChangeTo
+                      = serverParametersUserToChangeTo parameters,
+                    daemonGroupToChangeTo
+                      = serverParametersGroupToChangeTo parameters
+                  }
     else return ()
-  let acceptLoop' = do
-        (socket, peer) <- Network.accept listenSocket
-        inputBufferMVar <- newMVar BS.empty
-        requestLoop inputBufferMVar
-                    accessLogMaybeHandleMVar
-                    errorLogMaybeHandleMVar
-                    socket
-                    peer
-                    fork
-                    handler
-        acceptLoop'
-  acceptLoop'
+  let state = HTTPState {
+                httpStateAccessLogMaybeHandleMVar
+                  = accessLogMaybeHandleMVar,
+                httpStateErrorLogMaybeHandleMVar
+                  = errorLogMaybeHandleMVar,
+                httpStateMaybeConnection = Nothing
+              }
+  let acceptLoop' listenSocket = do
+        (socket, peer) <- liftIO $ Network.accept listenSocket
+        state <- ask
+        liftIO $ fork $ flip runReaderT state
+                        $ requestLoop socket peer handler
+        acceptLoop' listenSocket
+  flip runReaderT state $ do
+    httpLog $ "Server started."
+    acceptLoop' listenSocket
 
 
 createListenSocket :: IO Network.Socket
@@ -349,110 +408,101 @@ createListenSocket = do
   return listenSocket
 
 
-daemonize :: IO ()
-daemonize = do
-  putStrLn $ "Pretend-daemonizing."
-  -- TODO
-
-
-requestLoop :: MVar ByteString
-            -> MVar (Maybe Handle)
-            -> MVar (Maybe Handle)
-            -> Network.Socket
+requestLoop :: Network.Socket
             -> Network.SockAddr
-            -> (IO () -> IO ThreadId)
             -> HTTP ()
-            -> IO ()
-requestLoop inputBufferMVar
-            accessLogMaybeHandleMVar
-            errorLogMaybeHandleMVar
-            socket
-            peer
-            fork
-            handler = do
-  timestampMVar <- newEmptyMVar
-  queryStringMVar <- newEmptyMVar
-  remoteHostnameMVar <- newMVar Nothing
-  requestMethodMVar <- newEmptyMVar
-  requestURIMVar <- newEmptyMVar
-  requestProtocolMVar <- newEmptyMVar
-  requestHeaderMapMVar <- newEmptyMVar
-  responseHeadersSentMVar <- newMVar $ False
-  responseStatusMVar <- newMVar $ 200
-  responseHeaderMapMVar <- newMVar $ Map.fromList
-                           [(HttpContentType, UTF8.fromString "text/html")]
-  responseCookieMapMVar <- newMVar $ Map.empty
-  let state = HTTPState {
-                httpStateAccessLogMaybeHandleMVar = accessLogMaybeHandleMVar,
-                httpStateErrorLogMaybeHandleMVar = errorLogMaybeHandleMVar,
-                httpStateSocket = socket,
-                httpStatePeer = peer,
-                httpStateInputBufferMVar = inputBufferMVar,
-                httpStateTimestamp = timestampMVar,
-                httpStateQueryString = queryStringMVar,
-                httpStateRemoteHostname = remoteHostnameMVar,
-                httpStateRequestMethod = requestMethodMVar,
-                httpStateRequestURI = requestURIMVar,
-                httpStateRequestProtocol = requestProtocolMVar,
-                httpStateRequestHeaderMap = requestHeaderMapMVar,
-                httpStateResponseHeadersSent = responseHeadersSentMVar,
-                httpStateResponseStatus = responseStatusMVar,
-                httpStateResponseHeaderMap = responseHeaderMapMVar,
-                httpStateResponseCookieMap = responseCookieMapMVar
-              }
-  maybeRequestInfo <- runReaderT recvHeaders state
-  case maybeRequestInfo of
-    Nothing -> do
-      liftIO $ Exception.catch (Network.sClose socket)
-                               (\error -> do
-                                  return $ error :: IO Exception.IOException
-                                  return ())
-      return ()
-    Just (method, url, protocol, headers) -> do
-      timestamp <- liftIO $ getPOSIXTime
-      putMVar timestampMVar timestamp
-      putMVar queryStringMVar Nothing -- TODO
-      putMVar requestMethodMVar $ UTF8.toString method
-      putMVar requestURIMVar $ UTF8.toString url
-      putMVar requestProtocolMVar $ UTF8.toString protocol
-      putMVar requestHeaderMapMVar headers
-      fork $ do
-        Exception.catch
-          (flip runReaderT state $ do
-             valid <- getRequestValid
-             if valid
-               then do
-                 prepareResponse
-                 handler
-               else do
-                 setResponseStatus 400
-             httpCloseOutput
-             logAccess)
-          (\error -> flip runReaderT state $ do
-            httpLog $ "Uncaught exception: "
-                      ++ (show (error :: Exception.SomeException))
-            alreadySent <- responseHeadersSent
-            if alreadySent
-              then return ()
-              else setResponseStatus 500
+            -> HTTP ()
+requestLoop socket peer handler = do
+  inputBufferMVar <- liftIO $ newMVar $ BS.empty
+  timestampMVar <- liftIO $ newEmptyMVar
+  queryStringMVar <- liftIO $ newEmptyMVar
+  remoteHostnameMVar <- liftIO $ newMVar Nothing
+  requestMethodMVar <- liftIO $ newEmptyMVar
+  requestURIMVar <- liftIO $ newEmptyMVar
+  requestProtocolMVar <- liftIO $ newEmptyMVar
+  requestHeaderMapMVar <- liftIO $ newEmptyMVar
+  responseHeadersSentMVar <- liftIO $ newEmptyMVar
+  responseStatusMVar <- liftIO $ newEmptyMVar
+  responseHeaderMapMVar <- liftIO $ newEmptyMVar
+  responseCookieMapMVar <- liftIO $ newEmptyMVar
+  let connection = HTTPConnection {
+                     httpConnectionSocket = socket,
+                     httpConnectionPeer = peer,
+                     httpConnectionInputBufferMVar = inputBufferMVar,
+                     httpConnectionTimestamp = timestampMVar,
+                     httpConnectionQueryString = queryStringMVar,
+                     httpConnectionRemoteHostname = remoteHostnameMVar,
+                     httpConnectionRequestMethod = requestMethodMVar,
+                     httpConnectionRequestURI = requestURIMVar,
+                     httpConnectionRequestProtocol = requestProtocolMVar,
+                     httpConnectionRequestHeaderMap = requestHeaderMapMVar,
+                     httpConnectionResponseHeadersSent = responseHeadersSentMVar,
+                     httpConnectionResponseStatus = responseStatusMVar,
+                     httpConnectionResponseHeaderMap = responseHeaderMapMVar,
+                     httpConnectionResponseCookieMap = responseCookieMapMVar
+                   }
+      requestLoop' = do
+        maybeRequestInfo <- recvHeaders
+        case maybeRequestInfo of
+          Nothing -> do
+            liftIO $ Exception.catch (Network.sClose socket)
+                                     (\error -> do
+                                        return $ error
+                                          :: IO Exception.IOException
+                                        return ())
+            return ()
+          Just (method, url, protocol, headers) -> do
+            timestamp <- liftIO $ getPOSIXTime
+            liftIO $ putMVar timestampMVar timestamp
+            liftIO $ putMVar queryStringMVar Nothing -- TODO
+            liftIO $ putMVar requestMethodMVar $ UTF8.toString method
+            liftIO $ putMVar requestURIMVar $ UTF8.toString url
+            liftIO $ putMVar requestProtocolMVar $ UTF8.toString protocol
+            liftIO $ putMVar requestHeaderMapMVar headers
+            liftIO $ putMVar responseHeadersSentMVar False
+            liftIO $ putMVar responseStatusMVar 200
+            liftIO $ putMVar responseHeaderMapMVar Map.empty
+            liftIO $ putMVar responseCookieMapMVar Map.empty
+            httpCatch
+              (do
+                valid <- getRequestValid
+                if valid
+                  then do
+                    prepareResponse
+                    handler
+                  else do
+                    setResponseStatus 400)
+              (\error -> do
+                 httpLog $ "Uncaught exception: "
+                           ++ (show (error :: Exception.SomeException))
+                 alreadySent <- responseHeadersSent
+                 if alreadySent
+                   then return ()
+                   else setResponseStatus 500)
             httpCloseOutput
-            logAccess)
-        return ()
-      requestLoop inputBufferMVar
-                  accessLogMaybeHandleMVar
-                  errorLogMaybeHandleMVar
-                  socket
-                  peer
-                  fork
-                  handler
+            logAccess
+            liftIO $ takeMVar timestampMVar
+            liftIO $ takeMVar queryStringMVar
+            liftIO $ takeMVar requestMethodMVar
+            liftIO $ takeMVar requestURIMVar
+            liftIO $ takeMVar requestProtocolMVar
+            liftIO $ takeMVar requestHeaderMapMVar
+            liftIO $ takeMVar responseHeadersSentMVar
+            liftIO $ takeMVar responseStatusMVar
+            liftIO $ takeMVar responseHeaderMapMVar
+            liftIO $ takeMVar responseCookieMapMVar
+            requestLoop'
+  state <- ask
+  liftIO $ flip runReaderT
+                (state { httpStateMaybeConnection = Just connection })
+                requestLoop'
 
 
 getRequestValid :: HTTP Bool
 getRequestValid = do
   hasContent <- getRequestHasContent
-  httpLog $ "has content: " ++ show hasContent
   let getHeadersValid = do
-        HTTPState { httpStateRequestHeaderMap = mvar } <- getHTTPState
+        HTTPConnection { httpConnectionRequestHeaderMap = mvar } <- getHTTPConnection
         headerMap <- liftIO $ readMVar mvar
         return $ all (\header -> (isValidInRequest header)
                                  && (hasContent
@@ -480,12 +530,13 @@ getRequestValid = do
 
 prepareResponse :: HTTP ()
 prepareResponse = do
-  HTTPState { httpStateTimestamp = mvar } <- getHTTPState
+  HTTPConnection { httpConnectionTimestamp = mvar } <- getHTTPConnection
   timestamp <- liftIO $ readMVar mvar
   let dateString = formatTime defaultTimeLocale
                               "%a, %d %b %Y %H:%M:%S Z"
                               $ posixSecondsToUTCTime timestamp
   setResponseHeader HttpDate dateString
+  setResponseHeader HttpContentType "text/html; charset=UTF8"
 
 
 logAccess :: HTTP ()
@@ -493,14 +544,14 @@ logAccess = do
   maybePeerString <- getRemoteHost
   peerString <- case maybePeerString of
                   Nothing -> do
-                    HTTPState { httpStatePeer = peer } <- getHTTPState
+                    HTTPConnection { httpConnectionPeer = peer } <- getHTTPConnection
                     case peer of
                       Network.SockAddrInet _ address
                         -> liftIO $ Network.inet_ntoa address
                   Just peerString -> return peerString
   identString <- return "-"
   usernameString <- return "-"
-  HTTPState { httpStateTimestamp = timestampMVar } <- getHTTPState
+  HTTPConnection { httpConnectionTimestamp = timestampMVar } <- getHTTPConnection
   timestamp <- liftIO $ readMVar timestampMVar
   let timestampString = formatTime defaultTimeLocale
                                    "%-d/%b/%Y:%H:%M:%S %z"
@@ -668,7 +719,7 @@ recvHeaders :: HTTP (Maybe (ByteString,
                             ByteString,
                             Map Header ByteString))
 recvHeaders = do
-  HTTPState { httpStateInputBufferMVar = inputBufferMVar } <- getHTTPState
+  HTTPConnection { httpConnectionInputBufferMVar = inputBufferMVar } <- getHTTPConnection
   inputBuffer <- liftIO $ takeMVar inputBufferMVar
   (inputBuffer, maybeLine) <- recvLine inputBuffer
   result <- case maybeLine of
@@ -730,7 +781,7 @@ parseHeader line = do
 
 logInvalidRequest :: HTTP ()
 logInvalidRequest = do
-  HTTPState { httpStatePeer = Network.SockAddrInet _ address } <- getHTTPState
+  HTTPConnection { httpConnectionPeer = Network.SockAddrInet _ address } <- getHTTPConnection
   peerString <- liftIO $ Network.inet_ntoa address
   httpLog $ "Invalid request from " ++ peerString ++ "; closing its connection."
 
@@ -779,7 +830,7 @@ recvLine inputBuffer = do
 
 extendInputBuffer :: ByteString -> Int -> Bool -> HTTP (ByteString, Bool)
 extendInputBuffer inputBuffer length blocking = do
-  HTTPState { httpStateSocket = socket } <- getHTTPState
+  HTTPConnection { httpConnectionSocket = socket } <- getHTTPConnection
   let loop inputBuffer = do
         if BS.length inputBuffer < length
           then do
@@ -1249,7 +1300,7 @@ getRequestHeader
     => Header -- ^ The header to query.  Must be a request or entity header.
     -> m (Maybe String) -- ^ The value of the header, if the user agent provided one.
 getRequestHeader header = do
-  HTTPState { httpStateRequestHeaderMap = mvar } <- getHTTPState
+  HTTPConnection { httpConnectionRequestHeaderMap = mvar } <- getHTTPConnection
   headerMap <- liftIO $ readMVar mvar
   return $ fmap UTF8.toString $ Map.lookup header headerMap
 
@@ -1258,7 +1309,7 @@ getRequestHeader header = do
 --   entity headers from the user agent.
 getAllRequestHeaders :: (MonadHTTP m) => m [(Header, String)]
 getAllRequestHeaders = do
-  HTTPState { httpStateRequestHeaderMap = mvar } <- getHTTPState
+  HTTPConnection { httpConnectionRequestHeaderMap = mvar } <- getHTTPConnection
   headerMap <- liftIO $ readMVar mvar
   return $ map (\(header, bytestring) -> (header, UTF8.toString bytestring))
                $ Map.toList headerMap
@@ -1325,7 +1376,7 @@ getPathTranslated = do
 -- | Return the query string, as provided by the user agent.
 getQueryString :: (MonadHTTP m) => m (Maybe String)
 getQueryString = do
-  HTTPState { httpStateQueryString = mvar } <- getHTTPState
+  HTTPConnection { httpConnectionQueryString = mvar } <- getHTTPConnection
   liftIO $ readMVar mvar
 
 
@@ -1346,7 +1397,7 @@ getRedirectURI = do
 -- | Return the remote address.
 getRemoteAddress :: (MonadHTTP m) => m (Maybe Network.HostAddress)
 getRemoteAddress = do
-  HTTPState { httpStatePeer = peer } <- getHTTPState
+  HTTPConnection { httpConnectionPeer = peer } <- getHTTPConnection
   case peer of
     Network.SockAddrInet _ address -> return $ Just address
 
@@ -1354,7 +1405,7 @@ getRemoteAddress = do
 -- | Return the remote port.
 getRemotePort :: (MonadHTTP m) => m (Maybe Int)
 getRemotePort = do
-  HTTPState { httpStatePeer = peer } <- getHTTPState
+  HTTPConnection { httpConnectionPeer = peer } <- getHTTPConnection
   case peer of
     Network.SockAddrInet port _ -> do
       return $ Just $ fromIntegral port
@@ -1365,11 +1416,11 @@ getRemotePort = do
 --   time-consuming.
 getRemoteHost :: (MonadHTTP m) => m (Maybe String)
 getRemoteHost = do
-  HTTPState { httpStateRemoteHostname = mvar } <- getHTTPState
+  HTTPConnection { httpConnectionRemoteHostname = mvar } <- getHTTPConnection
   maybeMaybeHostname <- liftIO $ readMVar mvar
   case maybeMaybeHostname of
     Nothing -> do
-      HTTPState { httpStatePeer = peer } <- getHTTPState
+      HTTPConnection { httpConnectionPeer = peer } <- getHTTPConnection
       inputHostname <- case peer of
         Network.SockAddrInet _ address -> do
           string <- liftIO $ Network.inet_ntoa address
@@ -1411,20 +1462,20 @@ getRemoteUser = do
 -- | Return the request method.
 getRequestMethod :: (MonadHTTP m) => m (Maybe String)
 getRequestMethod = do
-  HTTPState { httpStateRequestMethod = mvar } <- getHTTPState
+  HTTPConnection { httpConnectionRequestMethod = mvar } <- getHTTPConnection
   liftIO $ readMVar mvar >>= return . Just
 
 
 -- | Return the request URI.
 getRequestURI :: (MonadHTTP m) => m (Maybe String)
 getRequestURI = do
-  HTTPState { httpStateRequestURI = mvar } <- getHTTPState
+  HTTPConnection { httpConnectionRequestURI = mvar } <- getHTTPConnection
   liftIO $ readMVar mvar >>= return . Just
 
 
 getRequestProtocol :: (MonadHTTP m) => m (Maybe String)
 getRequestProtocol = do
-  HTTPState { httpStateRequestProtocol = protocolMVar } <- getHTTPState
+  HTTPConnection { httpConnectionRequestProtocol = protocolMVar } <- getHTTPConnection
   liftIO $ readMVar protocolMVar >>= return . Just
 
 
@@ -1547,7 +1598,7 @@ httpGet' :: (MonadHTTP m) => Int -> Bool -> m BS.ByteString
 httpGet' size nonBlocking = do
   requireOutputNotYetClosed
   {-
-  HTTPState { request = Just request } <- getHTTPState
+  HTTPConnection { request = Just request } <- getHTTPConnection
   extendStdinStreamBufferToLength size nonBlocking
   stdinStreamBuffer <- liftIO $ takeMVar $ stdinStreamBufferMVar request
   if size <= BS.length stdinStreamBuffer
@@ -1573,7 +1624,7 @@ httpGetContents :: (MonadHTTP m) => m BS.ByteString
 httpGetContents = do
   requireOutputNotYetClosed
   {-
-  HTTPState { request = Just request } <- getHTTPState
+  HTTPConnection { request = Just request } <- getHTTPConnection
   let extend = do
         stdinStreamBuffer <- liftIO $ readMVar $ stdinStreamBufferMVar request
         extendStdinStreamBufferToLength (BS.length stdinStreamBuffer + 1) False
@@ -1596,7 +1647,7 @@ httpGetContents = do
 httpIsReadable :: (MonadHTTP m) => m Bool
 httpIsReadable = do
   {-
-  HTTPState { request = Just request } <- getHTTPState
+  HTTPConnection { request = Just request } <- getHTTPConnection
   stdinStreamBuffer <- liftIO $ readMVar $ stdinStreamBufferMVar request
   if BS.length stdinStreamBuffer > 0
     then return True
@@ -1618,7 +1669,7 @@ setResponseStatus
     -> m ()
 setResponseStatus status = do
   requireResponseHeadersNotYetSent
-  HTTPState { httpStateResponseStatus = mvar } <- getHTTPState
+  HTTPConnection { httpConnectionResponseStatus = mvar } <- getHTTPConnection
   liftIO $ swapMVar mvar status
   return ()
       
@@ -1630,7 +1681,7 @@ getResponseStatus
     :: (MonadHTTP m)
     => m Int -- ^ The HTTP/1.1 status code.
 getResponseStatus = do
-  HTTPState { httpStateResponseStatus = mvar } <- getHTTPState
+  HTTPConnection { httpConnectionResponseStatus = mvar } <- getHTTPConnection
   liftIO $ readMVar mvar
 
 
@@ -1651,7 +1702,7 @@ setResponseHeader header value = do
   requireResponseHeadersNotYetSent
   if isValidInResponse header
     then do
-      HTTPState { httpStateResponseHeaderMap = mvar } <- getHTTPState
+      HTTPConnection { httpConnectionResponseHeaderMap = mvar } <- getHTTPConnection
       headerMap <- liftIO $ takeMVar mvar
       headerMap <- return $ Map.insert header (UTF8.fromString value) headerMap
       liftIO $ putMVar mvar headerMap
@@ -1674,7 +1725,7 @@ unsetResponseHeader header = do
   requireResponseHeadersNotYetSent
   if isValidInResponse header
     then do
-      HTTPState { httpStateResponseHeaderMap = mvar } <- getHTTPState
+      HTTPConnection { httpConnectionResponseHeaderMap = mvar } <- getHTTPConnection
       headerMap <- liftIO $ takeMVar mvar
       headerMap <- return $ Map.delete header headerMap
       liftIO $ putMVar mvar headerMap
@@ -1694,7 +1745,7 @@ getResponseHeader header = do
   requireResponseHeadersNotYetSent
   if isValidInResponse header
     then do
-      HTTPState { httpStateResponseHeaderMap = mvar } <- getHTTPState
+      HTTPConnection { httpConnectionResponseHeaderMap = mvar } <- getHTTPConnection
       headerMap <- liftIO $ readMVar mvar
       return $ fmap UTF8.toString $ Map.lookup header headerMap
     else httpThrow $ NotAResponseHeader header
@@ -1717,7 +1768,7 @@ setCookie cookie = do
   requireResponseHeadersNotYetSent
   requireValidCookieName $ cookieName cookie
   {-
-  HTTPState { request = Just request } <- getHTTPState
+  HTTPConnection { request = Just request } <- getHTTPConnection
   responseCookieMap <- liftIO $ takeMVar $ responseCookieMapMVar request
   let responseCookieMap' = Map.insert (cookieName cookie) cookie responseCookieMap
   liftIO $ putMVar (responseCookieMapMVar request) responseCookieMap'
@@ -1742,7 +1793,7 @@ unsetCookie name = do
   requireResponseHeadersNotYetSent
   requireValidCookieName name
   {-
-  HTTPState { request = Just request } <- getHTTPState
+  HTTPConnection { request = Just request } <- getHTTPConnection
   responseCookieMap <- liftIO $ takeMVar $ responseCookieMapMVar request
   let responseCookieMap' = Map.insert name (mkUnsetCookie name) responseCookieMap
   liftIO $ putMVar (responseCookieMapMVar request) responseCookieMap'
@@ -1876,13 +1927,13 @@ seeOtherRedirect url = do
 sendResponseHeaders :: (MonadHTTP m) => m ()
 sendResponseHeaders = do
   requireOutputNotYetClosed
-  HTTPState {
-      httpStateSocket = socket,
-      httpStateResponseHeadersSent = alreadySentMVar,
-      httpStateResponseStatus = responseStatusMVar,
-      httpStateResponseHeaderMap = responseHeaderMapMVar,
-      httpStateResponseCookieMap = responseCookieMapMVar
-    } <- getHTTPState
+  HTTPConnection {
+      httpConnectionSocket = socket,
+      httpConnectionResponseHeadersSent = alreadySentMVar,
+      httpConnectionResponseStatus = responseStatusMVar,
+      httpConnectionResponseHeaderMap = responseHeaderMapMVar,
+      httpConnectionResponseCookieMap = responseCookieMapMVar
+    } <- getHTTPConnection
   alreadySent <- liftIO $ takeMVar alreadySentMVar
   if not alreadySent
     then do
@@ -1964,7 +2015,7 @@ reasonPhrase status =
 -- | Returns whether the response headers have been sent.
 responseHeadersSent :: (MonadHTTP m) => m Bool
 responseHeadersSent = do
-  HTTPState { httpStateResponseHeadersSent = mvar } <- getHTTPState
+  HTTPConnection { httpConnectionResponseHeadersSent = mvar } <- getHTTPConnection
   liftIO $ readMVar mvar
 
 
@@ -2006,7 +2057,7 @@ httpCloseOutput = do
 httpIsWritable :: (MonadHTTP m) => m Bool
 httpIsWritable = do
   {-
-  HTTPState { request = Just request } <- getHTTPState
+  HTTPConnection { request = Just request } <- getHTTPConnection
   requestEnded <- liftIO $ readMVar $ requestEndedMVar request
   return $ not requestEnded
   -}
@@ -2031,7 +2082,7 @@ requireResponseHeadersNotYetSent = do
 requireOutputNotYetClosed :: (MonadHTTP m) => m ()
 requireOutputNotYetClosed = do
   {-
-  HTTPState { request = Just request } <- getHTTPState
+  HTTPConnection { request = Just request } <- getHTTPConnection
   requestEnded <- liftIO $ readMVar $ requestEndedMVar request
   if requestEnded
     then httpThrow OutputAlreadyClosed
