@@ -442,6 +442,12 @@ requestLoop socket peer handler = do
                      httpConnectionResponseCookieMap = responseCookieMapMVar
                    }
       requestLoop' = do
+        httpCatch requestLoop''
+                  (\error -> do
+                     httpLog $ "Internal uncaught exception: "
+                               ++ (show (error :: Exception.SomeException))
+                     liftIO $ Network.sClose socket)
+      requestLoop'' = do
         maybeRequestInfo <- recvHeaders
         case maybeRequestInfo of
           Nothing -> do
@@ -479,8 +485,8 @@ requestLoop socket peer handler = do
                  if alreadySent
                    then return ()
                    else setResponseStatus 500)
-            httpCloseOutput
             logAccess
+            httpCloseOutput
             liftIO $ takeMVar timestampMVar
             liftIO $ takeMVar queryStringMVar
             liftIO $ takeMVar requestMethodMVar
@@ -491,7 +497,7 @@ requestLoop socket peer handler = do
             liftIO $ takeMVar responseStatusMVar
             liftIO $ takeMVar responseHeaderMapMVar
             liftIO $ takeMVar responseCookieMapMVar
-            requestLoop'
+            requestLoop''
   state <- ask
   liftIO $ flip runReaderT
                 (state { httpStateMaybeConnection = Just connection })
@@ -502,7 +508,8 @@ getRequestValid :: HTTP Bool
 getRequestValid = do
   hasContent <- getRequestHasContent
   let getHeadersValid = do
-        HTTPConnection { httpConnectionRequestHeaderMap = mvar } <- getHTTPConnection
+        HTTPConnection { httpConnectionRequestHeaderMap = mvar }
+          <- getHTTPConnection
         headerMap <- liftIO $ readMVar mvar
         return $ all (\header -> (isValidInRequest header)
                                  && (hasContent
@@ -848,21 +855,18 @@ extendInputBuffer inputBuffer length blocking = do
 httpLog :: (MonadHTTP m) => String -> m ()
 httpLog message = do
   HTTPState { httpStateErrorLogMaybeHandleMVar = logMVar } <- getHTTPState
-  liftIO $ withMVar logMVar
-                    (\maybeHandle -> case maybeHandle of
-                                       Nothing -> return ()
-                                       Just handle -> do
-                                         timestamp <- liftIO $ getPOSIXTime
-                                         let timestampString
-                                              = formatTime
-                                                 defaultTimeLocale
-                                                 "%Y-%m-%dT%H:%M:%SZ"
-                                                 $ posixSecondsToUTCTime
-                                                    timestamp
-                                         hPutStrLn handle
-                                                   $ timestampString ++ " "
-                                                     ++ message
-                                         hFlush handle)
+  httpBracket (liftIO $ takeMVar logMVar)
+              (\maybeHandle -> liftIO $ putMVar logMVar maybeHandle)
+              (\maybeHandle -> do
+                 case maybeHandle of
+                   Nothing -> return ()
+                   Just handle -> do
+                     timestamp <- liftIO $ getPOSIXTime
+                     let timestampString
+                           = formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
+                                        $ posixSecondsToUTCTime timestamp
+                     liftIO $ hPutStrLn handle $ timestampString ++ " " ++ message
+                     liftIO $ hFlush handle)
 
 
 -- | Logs a message using the web server's logging facility.
@@ -1294,7 +1298,9 @@ getAllRequestVariables = do
   return $ map fromJust $ filter isJust result
 
 
--- | Queries the value from the user agent of the given HTTP/1.1 header.
+-- | Queries the value from the user agent of the given HTTP/1.1 header.  If the
+--   header is to be provided after the content as specified by the Trailer
+--   header, this is potentially time-consuming.
 getRequestHeader
     :: (MonadHTTP m)
     => Header -- ^ The header to query.  Must be a request or entity header.
@@ -1305,8 +1311,10 @@ getRequestHeader header = do
   return $ fmap UTF8.toString $ Map.lookup header headerMap
 
 
--- | Returns an association list of name-value pairs of all the HTTP/1.1 request or
---   entity headers from the user agent.
+-- | Returns an association list of name-value pairs of all the HTTP/1.1 request
+--   or entity headers from the user agent.  If some of these headers are to be
+--   provided after the content as specified by the Trailer header, this is
+--   potentially time-consuming.
 getAllRequestHeaders :: (MonadHTTP m) => m [(Header, String)]
 getAllRequestHeaders = do
   HTTPConnection { httpConnectionRequestHeaderMap = mvar } <- getHTTPConnection
