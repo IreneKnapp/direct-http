@@ -202,6 +202,17 @@ data Cookie = Cookie {
   } deriving (Show)
 
 
+data ConnectionTerminatingError = UnexpectedEndOfInput
+                                  deriving (Typeable)
+
+
+instance Exception.Exception ConnectionTerminatingError
+
+
+instance Show ConnectionTerminatingError where
+  show UnexpectedEndOfInput = "Unexpected end of input."
+
+
 -- | The monad within which each single request from a client is handled.
 type HTTP = ReaderT HTTPState IO
 
@@ -448,6 +459,17 @@ requestLoop socket peer handler = do
                                ++ (show (error :: Exception.SomeException))
                      liftIO $ Network.sClose socket)
       requestLoop'' = do
+        httpCatch requestLoop'''
+                  (\error -> do
+                     HTTPConnection {
+                         httpConnectionPeer = Network.SockAddrInet _ address
+                       } <- getHTTPConnection
+                     peerString <- liftIO $ Network.inet_ntoa address
+                     httpLog $ "Connection from " ++ peerString
+                               ++ " terminated due to error: "
+                               ++ (show (error :: ConnectionTerminatingError))
+                     liftIO $ Network.sClose socket)
+      requestLoop''' = do
         maybeRequestInfo <- recvHeaders
         case maybeRequestInfo of
           Nothing -> do
@@ -497,14 +519,14 @@ requestLoop socket peer handler = do
             liftIO $ takeMVar responseStatusMVar
             liftIO $ takeMVar responseHeaderMapMVar
             liftIO $ takeMVar responseCookieMapMVar
-            requestLoop''
+            requestLoop'''
   state <- ask
   liftIO $ flip runReaderT
                 (state { httpStateMaybeConnection = Just connection })
                 requestLoop'
 
 
-getRequestValid :: HTTP Bool
+getRequestValid :: (MonadHTTP m) => m Bool
 getRequestValid = do
   hasContent <- getRequestHasContent
   let getHeadersValid = do
@@ -535,7 +557,7 @@ getRequestValid = do
       return $ and [headersValid, mandatoryHeadersIncluded, contentValid]
 
 
-prepareResponse :: HTTP ()
+prepareResponse :: (MonadHTTP m) => m ()
 prepareResponse = do
   HTTPConnection { httpConnectionTimestamp = mvar } <- getHTTPConnection
   timestamp <- liftIO $ readMVar mvar
@@ -546,7 +568,7 @@ prepareResponse = do
   setResponseHeader HttpContentType "text/html; charset=UTF8"
 
 
-logAccess :: HTTP ()
+logAccess :: (MonadHTTP m) => m ()
 logAccess = do
   maybePeerString <- getRemoteHost
   peerString <- case maybePeerString of
@@ -567,7 +589,7 @@ logAccess = do
   urlString <- getRequestURI >>= return . fromJust
   protocolString <- getRequestProtocol >>= return . fromJust
   responseStatusString <- getResponseStatus >>= return . show
-  maybeResponseSize <- return Nothing :: HTTP (Maybe Int) -- TODO
+  maybeResponseSize <- return (Nothing :: Maybe Int) -- TODO
   responseSizeString
     <- case maybeResponseSize of
          Nothing -> return "-"
@@ -721,7 +743,8 @@ parseInt string =
       else Nothing
 
 
-recvHeaders :: HTTP (Maybe (ByteString,
+recvHeaders :: (MonadHTTP m)
+               => m (Maybe (ByteString,
                             ByteString,
                             ByteString,
                             Map Header ByteString))
@@ -786,7 +809,7 @@ parseHeader line = do
     (name, delimitedValue) -> Just (toHeader name, BS.drop 1 delimitedValue)
 
 
-logInvalidRequest :: HTTP ()
+logInvalidRequest :: MonadHTTP m => m ()
 logInvalidRequest = do
   HTTPConnection { httpConnectionPeer = Network.SockAddrInet _ address } <- getHTTPConnection
   peerString <- liftIO $ Network.inet_ntoa address
@@ -817,7 +840,7 @@ isValidProtocol bytestring
   | otherwise = False
 
 
-recvLine :: ByteString -> HTTP (ByteString, Maybe ByteString)
+recvLine :: (MonadHTTP m) => ByteString -> m (ByteString, Maybe ByteString)
 recvLine inputBuffer = do
   let loop inputBuffer length = do
         (inputBuffer, endOfInput)
@@ -835,7 +858,19 @@ recvLine inputBuffer = do
   loop inputBuffer 80
 
 
-extendInputBuffer :: ByteString -> Int -> Bool -> HTTP (ByteString, Bool)
+recvBlock :: (MonadHTTP m) => Int -> m ByteString
+recvBlock length = do
+  HTTPConnection { httpConnectionInputBufferMVar = inputBufferMVar } <- getHTTPConnection
+  inputBuffer <- liftIO $ takeMVar inputBufferMVar
+  (inputBuffer, endOfInput)
+    <- extendInputBuffer inputBuffer length True
+  (result, inputBuffer) <- return $ BS.splitAt length inputBuffer
+  liftIO $ putMVar inputBufferMVar inputBuffer
+  return result
+
+
+extendInputBuffer :: (MonadHTTP m)
+                  => ByteString -> Int -> Bool -> m (ByteString, Bool)
 extendInputBuffer inputBuffer length blocking = do
   HTTPConnection { httpConnectionSocket = socket } <- getHTTPConnection
   let loop inputBuffer = do
@@ -1308,7 +1343,27 @@ getRequestHeader
 getRequestHeader header = do
   HTTPConnection { httpConnectionRequestHeaderMap = mvar } <- getHTTPConnection
   headerMap <- liftIO $ readMVar mvar
-  return $ fmap UTF8.toString $ Map.lookup header headerMap
+  return $ fmap (stripHeaderValueWhitespace . UTF8.toString)
+                $ Map.lookup header headerMap
+
+
+stripHeaderValueWhitespace :: String -> String
+stripHeaderValueWhitespace input =
+  let input' = reverse $ dropWhile isHeaderValueWhitespace
+                       $ reverse $ dropWhile isHeaderValueWhitespace input
+      computeWords input = case break isHeaderValueWhitespace input of
+                             (all, "") -> [all]
+                             (before, after)
+                               -> [before]
+                                  ++ (computeWords
+                                      $ dropWhile isHeaderValueWhitespace after)
+      words = computeWords input'
+      output = intercalate " " words
+  in output
+
+
+isHeaderValueWhitespace :: Char -> Bool
+isHeaderValueWhitespace char = elem char " \t\r\n"
 
 
 -- | Returns an association list of name-value pairs of all the HTTP/1.1 request
@@ -1561,9 +1616,9 @@ getContentType = do
 
 getRequestHasContent :: (MonadHTTP m) => m Bool
 getRequestHasContent = do
-  maybeLengthString <- getRequestHeader HttpContentLength
+  maybeLength <- getContentLength
   maybeTransferEncodingString <- getRequestHeader HttpTransferEncoding
-  case (maybeLengthString, maybeTransferEncodingString) of
+  case (maybeLength, maybeTransferEncodingString) of
     (Nothing, Nothing) -> return False
     _ -> return True
 
@@ -2057,7 +2112,6 @@ httpCloseOutput = do
   requireOutputNotYetClosed
   sendResponseHeaders
   terminateRequest
-  -- TODO
 
 
 -- | Returns whether it is possible to write more data; ie, whether output has not
@@ -2075,8 +2129,8 @@ httpIsWritable = do
 
 terminateRequest :: (MonadHTTP m) => m ()
 terminateRequest = do
+  readEntireRequestEntity
   return ()
-  -- TODO
 
 
 requireResponseHeadersNotYetSent :: (MonadHTTP m) => m ()
@@ -2098,6 +2152,39 @@ requireOutputNotYetClosed = do
    -}
   return ()
   -- TODO
+
+
+readEntireRequestEntity :: (MonadHTTP m) => m ()
+readEntireRequestEntity = do
+  requestHasContent <- getRequestHasContent
+  case requestHasContent of
+    False -> return ()
+    True -> do
+      maybeLength <- getContentLength
+      maybeTransferEncodingString <- getRequestHeader HttpTransferEncoding
+      let chunked = case (maybeLength, maybeTransferEncodingString) of
+                      (Just length, Nothing) -> False
+                      (Just length, Just encoding)
+                        | map toLower encoding == "identity" -> False
+                        | otherwise -> True
+                      (_, Just _) -> True
+      if chunked
+        then readEntireRequestEntityChunked
+        else readEntireRequestEntityIdentity $ fromJust maybeLength
+
+
+readEntireRequestEntityIdentity :: (MonadHTTP m) => Int -> m ()
+readEntireRequestEntityIdentity length = do
+  content <- recvBlock length
+  if BS.length content < length
+    then httpThrow UnexpectedEndOfInput
+    else return ()
+  httpLog $ "Received " ++ (show $ BS.length content) ++ " bytes."
+
+
+readEntireRequestEntityChunked :: (MonadHTTP m) => m ()
+readEntireRequestEntityChunked = do
+  httpLog "Bar"
 
 
 -- | Throw an exception in any 'MonadHTTP' monad.
