@@ -594,8 +594,14 @@ logAccess = do
     <- case maybeResponseSize of
          Nothing -> return "-"
          Just responseSize -> return $ show responseSize
-  referrerString <- return "http://www.example.com/start.html"
-  userAgentString <- return "Mozilla/4.08 [en] (Win98; I ;Nav)"
+  maybeReferrerString <- getRequestHeader HttpReferrer
+  referrerString <- case maybeReferrerString of
+                      Nothing -> return "-"
+                      Just referrerString -> return referrerString
+  maybeUserAgentString <- getRequestHeader HttpUserAgent
+  userAgentString <- case maybeUserAgentString of
+                      Nothing -> return "-"
+                      Just userAgentString -> return userAgentString
   httpAccessLog $ peerString
                   ++ " "
                   ++ identString
@@ -936,7 +942,7 @@ data Header
     | HttpMaxForwards
     | HttpProxyAuthorization
     | HttpRange
-    | HttpReferer
+    | HttpReferrer
     | HttpTE
     | HttpUserAgent
     -- | Response headers
@@ -1005,7 +1011,7 @@ headerType HttpIfUnmodifiedSince = RequestHeader
 headerType HttpMaxForwards = RequestHeader
 headerType HttpProxyAuthorization = RequestHeader
 headerType HttpRange = RequestHeader
-headerType HttpReferer = RequestHeader
+headerType HttpReferrer = RequestHeader
 headerType HttpTE = RequestHeader
 headerType HttpUserAgent = RequestHeader
 headerType HttpAcceptRanges = ResponseHeader
@@ -1058,7 +1064,7 @@ fromHeader HttpIfUnmodifiedSince = UTF8.fromString "If-Unmodified-Since"
 fromHeader HttpMaxForwards = UTF8.fromString "Max-Forwards"
 fromHeader HttpProxyAuthorization = UTF8.fromString "Proxy-Authorization"
 fromHeader HttpRange = UTF8.fromString "Range"
-fromHeader HttpReferer = UTF8.fromString "Referer"
+fromHeader HttpReferrer = UTF8.fromString "Referer"
 fromHeader HttpTE = UTF8.fromString "TE"
 fromHeader HttpUserAgent = UTF8.fromString "User-Agent"
 fromHeader HttpAcceptRanges = UTF8.fromString "Accept-Ranges"
@@ -1112,7 +1118,7 @@ toHeader bytestring
   | bytestring == UTF8.fromString "Max-Forwards" = HttpMaxForwards
   | bytestring == UTF8.fromString "Proxy-Authorization" = HttpProxyAuthorization
   | bytestring == UTF8.fromString "Range" = HttpRange
-  | bytestring == UTF8.fromString "Referer" = HttpReferer
+  | bytestring == UTF8.fromString "Referer" = HttpReferrer
   | bytestring == UTF8.fromString "TE" = HttpTE
   | bytestring == UTF8.fromString "User-Agent" = HttpUserAgent
   | bytestring == UTF8.fromString "Accept-Ranges" = HttpAcceptRanges
@@ -1184,7 +1190,7 @@ requestVariableNameToHeader "HTTP_IF_UNMODIFIED_SINCE" = Just HttpIfUnmodifiedSi
 requestVariableNameToHeader "HTTP_MAX_FORWARDS" = Just HttpMaxForwards
 requestVariableNameToHeader "HTTP_PROXY_AUTHORIZATION" = Just HttpProxyAuthorization
 requestVariableNameToHeader "HTTP_RANGE" = Just HttpRange
-requestVariableNameToHeader "HTTP_REFERER" = Just HttpReferer
+requestVariableNameToHeader "HTTP_REFERER" = Just HttpReferrer
 requestVariableNameToHeader "HTTP_TE" = Just HttpTE
 requestVariableNameToHeader "HTTP_USER_AGENT" = Just HttpUserAgent
 requestVariableNameToHeader "HTTP_ALLOW" = Just HttpAllow
@@ -2184,7 +2190,9 @@ readEntireRequestEntityIdentity length = do
 
 readEntireRequestEntityChunked :: (MonadHTTP m) => m ()
 readEntireRequestEntityChunked = do
-  httpLog "Bar"
+  httpLog "Request uses chunked encoding, which is not yet implemented."
+  httpThrow UnexpectedEndOfInput
+  -- TODO
 
 
 -- | Throw an exception in any 'MonadHTTP' monad.
