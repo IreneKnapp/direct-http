@@ -183,11 +183,21 @@ data HTTPConnection = HTTPConnection {
     httpConnectionRequestURI :: MVar String,
     httpConnectionRequestProtocol :: MVar String,
     httpConnectionRequestHeaderMap :: MVar (Map Header ByteString),
+    httpConnectionRequestContentBuffer :: MVar ByteString,
+    httpConnectionRequestContentParameters :: MVar RequestContentParameters,
     httpConnectionResponseHeadersSent :: MVar Bool,
     httpConnectionResponseStatus :: MVar Int,
     httpConnectionResponseHeaderMap :: MVar (Map Header ByteString),
     httpConnectionResponseCookieMap :: MVar (Map String Cookie)
   }
+
+
+data RequestContentParameters
+  = RequestContentUninitialized
+  | RequestContentNone
+  | RequestContentClosed
+  | RequestContentIdentity Int
+  | RequestContentChunked Bool Int
 
 
 data Cookie = Cookie {
@@ -432,6 +442,8 @@ requestLoop socket peer handler = do
   requestURIMVar <- liftIO $ newEmptyMVar
   requestProtocolMVar <- liftIO $ newEmptyMVar
   requestHeaderMapMVar <- liftIO $ newEmptyMVar
+  requestContentBufferMVar <- liftIO $ newEmptyMVar
+  requestContentParametersMVar <- liftIO $ newEmptyMVar
   responseHeadersSentMVar <- liftIO $ newEmptyMVar
   responseStatusMVar <- liftIO $ newEmptyMVar
   responseHeaderMapMVar <- liftIO $ newEmptyMVar
@@ -447,7 +459,12 @@ requestLoop socket peer handler = do
                      httpConnectionRequestURI = requestURIMVar,
                      httpConnectionRequestProtocol = requestProtocolMVar,
                      httpConnectionRequestHeaderMap = requestHeaderMapMVar,
-                     httpConnectionResponseHeadersSent = responseHeadersSentMVar,
+                     httpConnectionRequestContentBuffer
+                       = requestContentBufferMVar,
+                     httpConnectionRequestContentParameters
+                       = requestContentParametersMVar,
+                     httpConnectionResponseHeadersSent
+                       = responseHeadersSentMVar,
                      httpConnectionResponseStatus = responseStatusMVar,
                      httpConnectionResponseHeaderMap = responseHeaderMapMVar,
                      httpConnectionResponseCookieMap = responseCookieMapMVar
@@ -487,6 +504,9 @@ requestLoop socket peer handler = do
             liftIO $ putMVar requestURIMVar $ UTF8.toString url
             liftIO $ putMVar requestProtocolMVar $ UTF8.toString protocol
             liftIO $ putMVar requestHeaderMapMVar headers
+            liftIO $ putMVar requestContentBufferMVar BS.empty
+            liftIO $ putMVar requestContentParametersMVar
+                             RequestContentUninitialized
             liftIO $ putMVar responseHeadersSentMVar False
             liftIO $ putMVar responseStatusMVar 200
             liftIO $ putMVar responseHeaderMapMVar Map.empty
@@ -515,6 +535,8 @@ requestLoop socket peer handler = do
             liftIO $ takeMVar requestURIMVar
             liftIO $ takeMVar requestProtocolMVar
             liftIO $ takeMVar requestHeaderMapMVar
+            liftIO $ takeMVar requestContentBufferMVar
+            liftIO $ takeMVar requestContentParametersMVar
             liftIO $ takeMVar responseHeadersSentMVar
             liftIO $ takeMVar responseStatusMVar
             liftIO $ takeMVar responseHeaderMapMVar
@@ -1622,11 +1644,14 @@ getContentType = do
 
 getRequestHasContent :: (MonadHTTP m) => m Bool
 getRequestHasContent = do
-  maybeLength <- getContentLength
-  maybeTransferEncodingString <- getRequestHeader HttpTransferEncoding
-  case (maybeLength, maybeTransferEncodingString) of
-    (Nothing, Nothing) -> return False
-    _ -> return True
+  HTTPConnection { httpConnectionRequestContentParameters = parametersMVar }
+    <- getHTTPConnection
+  parameters <- liftIO $ takeMVar parametersMVar
+  parameters <- ensureRequestContentParametersInitialized parameters
+  liftIO $ putMVar parametersMVar parameters
+  return $ case parameters of
+    RequestContentNone -> False
+    _ -> True
 
 
 getRequestContentAllowed :: (MonadHTTP m) => m Bool
@@ -1644,89 +1669,129 @@ getRequestContentAllowed = do
       | otherwise -> return True
 
 
--- | Reads up to a specified amount of data from the input stream of the current request,
---   and interprets it as binary data.  This is the content data of the HTTP request,
---   if any.  If input has been closed, returns an empty bytestring.  If insufficient
---   input is available, blocks until there is enough.  If output has been closed,
---   causes an 'OutputAlreadyClosed' exception.
+-- | Reads up to a specified amount of data from the content of the HTTP
+--   request, if any, and interprets it as binary data.  If input has been
+--   closed, returns an empty bytestring.  If no input is immediately
+--   available, blocks until there is some.  If output has been closed, causes
+--   an 'OutputAlreadyClosed' exception.
 httpGet :: (MonadHTTP m) => Int -> m BS.ByteString
-httpGet size = httpGet' size False
+httpGet size = httpGet' (Just size) True
 
 
--- | Reads up to a specified amount of data from the input stream of the curent request,
---   and interprets it as binary data.  This is the content data of the HTTP request,
---   if any.  If input has been closed, returns an empty bytestring.  If insufficient
---   input is available, returns any input which is immediately available, or an empty
---   bytestring if there is none, never blocking.  If output has been closed, causes an
+-- | Reads up to a specified amount of data from the content of the HTTP
+--   request, if any, and interprets it as binary data.  If input has been
+--   closed, returns an empty bytestring.  If insufficient input is available,
+--   returns any input which is immediately available, or an empty bytestring
+--   if there is none, never blocking.  If output has been closed, causes an
 --   'OutputAlreadyClosed' exception.
 httpGetNonBlocking :: (MonadHTTP m) => Int -> m BS.ByteString
-httpGetNonBlocking size = httpGet' size True
+httpGetNonBlocking size = httpGet' (Just size) False
 
 
-httpGet' :: (MonadHTTP m) => Int -> Bool -> m BS.ByteString
-httpGet' size nonBlocking = do
-  requireOutputNotYetClosed
-  {-
-  HTTPConnection { request = Just request } <- getHTTPConnection
-  extendStdinStreamBufferToLength size nonBlocking
-  stdinStreamBuffer <- liftIO $ takeMVar $ stdinStreamBufferMVar request
-  if size <= BS.length stdinStreamBuffer
-    then do
-      let result = BS.take size stdinStreamBuffer
-          remainder = BS.drop size stdinStreamBuffer
-      liftIO $ putMVar (stdinStreamBufferMVar request) remainder
-      return result
-    else do
-      liftIO $ putMVar (stdinStreamBufferMVar request) BS.empty
-      return stdinStreamBuffer
-      -}
-  return BS.empty
-  -- TODO
-
-
--- | Reads all remaining data from the input stream of the current request, and
---   interprets it as binary data.  This is the content data of the HTTP request, if
---   any.  Blocks until all input has been read.  If input has been closed, returns an
---   empty bytestring.  If output has been closed, causes an 'OutputAlreadyClosed'
---   exception.
+-- | Reads all remaining data from the content of the HTTP request, if any,
+--   and interprets it as binary data.  Blocks until all input has been
+--   read.  If input has been closed, returns an empty bytestring.  If output
+--   has been closed, causes an 'OutputAlreadyClosed' exception.
 httpGetContents :: (MonadHTTP m) => m BS.ByteString
-httpGetContents = do
-  requireOutputNotYetClosed
-  {-
-  HTTPConnection { request = Just request } <- getHTTPConnection
-  let extend = do
-        stdinStreamBuffer <- liftIO $ readMVar $ stdinStreamBufferMVar request
-        extendStdinStreamBufferToLength (BS.length stdinStreamBuffer + 1) False
-        stdinStreamClosed <- liftIO $ readMVar $ stdinStreamClosedMVar request
-        if stdinStreamClosed
-          then do
-            stdinStreamBuffer
-                <- liftIO $ swapMVar (stdinStreamBufferMVar request) BS.empty
-            return stdinStreamBuffer
-          else extend
-  extend
-  -}
-  return BS.empty
-  -- TODO
+httpGetContents = httpGet' Nothing True
 
 
--- | Returns whether the input stream of the current request potentially has data
---   remaining, either in the buffer or yet to be read.  This is the content data of
---   the HTTP request, if any.
+-- | Returns whether the content of the HTTP request potentially has data
+--   remaining, either in the buffer or yet to be read.
 httpIsReadable :: (MonadHTTP m) => m Bool
 httpIsReadable = do
-  {-
-  HTTPConnection { request = Just request } <- getHTTPConnection
-  stdinStreamBuffer <- liftIO $ readMVar $ stdinStreamBufferMVar request
-  if BS.length stdinStreamBuffer > 0
-    then return True
-    else do
-      stdinStreamClosed <- liftIO $ readMVar $ stdinStreamClosedMVar request
-      requestEnded <- liftIO $ readMVar $ requestEndedMVar request
-      return $ (not stdinStreamClosed) && (not requestEnded)
-   -}
-  return False
-  -- TODO
+  HTTPConnection { httpConnectionRequestContentParameters = parametersMVar }
+    <- getHTTPConnection
+  parameters <- liftIO $ takeMVar parametersMVar
+  parameters <- ensureRequestContentParametersInitialized parameters
+  liftIO $ putMVar parametersMVar parameters
+  return $ case parameters of
+             RequestContentNone -> False
+             RequestContentClosed -> False
+             _ -> True
+
+
+httpGet' :: (MonadHTTP m) => (Maybe Int) -> Bool -> m BS.ByteString
+httpGet' maybeSize blocking = do
+  requireOutputNotYetClosed
+  HTTPConnection {
+      httpConnectionRequestContentBuffer = bufferMVar,
+      httpConnectionRequestContentParameters = parametersMVar
+    } <- getHTTPConnection
+  buffer <- liftIO $ takeMVar bufferMVar
+  parameters <- liftIO $ takeMVar parametersMVar
+  parameters <- ensureRequestContentParametersInitialized parameters
+  (buffer, parameters)
+    <- extendRequestContentBuffer buffer parameters maybeSize blocking
+  (result, buffer) <- return $ case maybeSize of
+                        Nothing -> (buffer, BS.empty)
+                        Just size -> BS.splitAt size buffer
+  liftIO $ putMVar parametersMVar parameters
+  liftIO $ putMVar bufferMVar buffer
+  return result
+
+
+ensureRequestContentParametersInitialized
+  :: (MonadHTTP m)
+  => RequestContentParameters
+  -> m RequestContentParameters
+ensureRequestContentParametersInitialized RequestContentUninitialized = do
+  maybeLength <- getContentLength
+  maybeTransferEncodingString <- getRequestHeader HttpTransferEncoding
+  let (hasContent, chunked)
+        = case (maybeLength, maybeTransferEncodingString) of
+            (Nothing, Nothing) -> (False, False)
+            (Just length, Nothing) -> (True, False)
+            (Just length, Just encoding)
+              | map toLower encoding == "identity" -> (True, False)
+              | otherwise -> (True, True)
+            (_, Just _) -> (True, True)
+  if hasContent
+    then if chunked
+           then return $ RequestContentChunked False 0
+           else return $ RequestContentIdentity $ fromJust maybeLength
+    else return RequestContentNone
+ensureRequestContentParametersInitialized parameters = return parameters
+
+
+extendRequestContentBuffer
+  :: (MonadHTTP m)
+  => BS.ByteString
+  -> RequestContentParameters
+  -> (Maybe Int)
+  -> Bool
+  -> m (BS.ByteString, RequestContentParameters)
+extendRequestContentBuffer buffer parameters maybeTargetLength blocking = do
+  let isAtLeastTargetLength buffer =
+        case maybeTargetLength of
+          Nothing -> False
+          Just targetLength -> BS.length buffer >= targetLength
+      loop buffer parameters = do
+        if isAtLeastTargetLength buffer
+          then return (buffer, parameters)
+          else do
+            case parameters of
+              RequestContentNone -> return (buffer, parameters)
+              RequestContentClosed -> return (buffer, parameters)
+              RequestContentIdentity lengthRemaining -> do
+                (buffer, endOfInput)
+                  <- extendInputBuffer buffer lengthRemaining blocking
+                if endOfInput
+                  then httpThrow UnexpectedEndOfInput
+                  else return ()
+                let lengthRemaining' = if lengthRemaining > BS.length buffer
+                                         then lengthRemaining - BS.length buffer
+                                         else 0
+                    parameters' = if lengthRemaining' > 0
+                                    then RequestContentIdentity lengthRemaining'
+                                    else RequestContentClosed
+                if not blocking || isAtLeastTargetLength buffer
+                  then return (buffer, parameters')
+                  else loop buffer parameters'
+              RequestContentChunked _ _ -> do
+                 httpLog $ "Don't understand chunked."
+                 httpThrow UnexpectedEndOfInput
+  loop buffer parameters
 
 
 -- | Sets the response status which will be sent with the response headers.  If the
@@ -2117,7 +2182,8 @@ httpCloseOutput :: (MonadHTTP m) => m ()
 httpCloseOutput = do
   requireOutputNotYetClosed
   sendResponseHeaders
-  terminateRequest
+  httpGetContents
+  return ()
 
 
 -- | Returns whether it is possible to write more data; ie, whether output has not
@@ -2131,12 +2197,6 @@ httpIsWritable = do
   -}
   return False
   -- TODO
-
-
-terminateRequest :: (MonadHTTP m) => m ()
-terminateRequest = do
-  readEntireRequestEntity
-  return ()
 
 
 requireResponseHeadersNotYetSent :: (MonadHTTP m) => m ()
@@ -2157,41 +2217,6 @@ requireOutputNotYetClosed = do
     else return ()
    -}
   return ()
-  -- TODO
-
-
-readEntireRequestEntity :: (MonadHTTP m) => m ()
-readEntireRequestEntity = do
-  requestHasContent <- getRequestHasContent
-  case requestHasContent of
-    False -> return ()
-    True -> do
-      maybeLength <- getContentLength
-      maybeTransferEncodingString <- getRequestHeader HttpTransferEncoding
-      let chunked = case (maybeLength, maybeTransferEncodingString) of
-                      (Just length, Nothing) -> False
-                      (Just length, Just encoding)
-                        | map toLower encoding == "identity" -> False
-                        | otherwise -> True
-                      (_, Just _) -> True
-      if chunked
-        then readEntireRequestEntityChunked
-        else readEntireRequestEntityIdentity $ fromJust maybeLength
-
-
-readEntireRequestEntityIdentity :: (MonadHTTP m) => Int -> m ()
-readEntireRequestEntityIdentity length = do
-  content <- recvBlock length
-  if BS.length content < length
-    then httpThrow UnexpectedEndOfInput
-    else return ()
-  httpLog $ "Received " ++ (show $ BS.length content) ++ " bytes."
-
-
-readEntireRequestEntityChunked :: (MonadHTTP m) => m ()
-readEntireRequestEntityChunked = do
-  httpLog "Request uses chunked encoding, which is not yet implemented."
-  httpThrow UnexpectedEndOfInput
   -- TODO
 
 

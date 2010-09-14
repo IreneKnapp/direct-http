@@ -1,6 +1,7 @@
 module Main where
 
 import Control.Concurrent
+import qualified Data.ByteString as BS
 import Network.HTTP
 import Network.Socket
 
@@ -21,5 +22,6 @@ main = do
                }
              forkIO
              $ do
-                 httpPutStr $ "Foo."
+                 inputData <- httpGet 4096
+                 httpPutStr $ "Received " ++ (show $ BS.length inputData) ++ " bytes."
                  return ()
