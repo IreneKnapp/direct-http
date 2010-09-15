@@ -109,6 +109,7 @@ module Network.HTTP (
              seeOtherRedirect,
              sendResponseHeaders,
              responseHeadersSent,
+             responseHeadersModifiable,
              httpPut,
              httpPutStr,
              httpCloseOutput,
@@ -186,9 +187,12 @@ data HTTPConnection = HTTPConnection {
     httpConnectionRequestContentBuffer :: MVar ByteString,
     httpConnectionRequestContentParameters :: MVar RequestContentParameters,
     httpConnectionResponseHeadersSent :: MVar Bool,
+    httpConnectionResponseHeadersModifiable :: MVar Bool,
     httpConnectionResponseStatus :: MVar Int,
     httpConnectionResponseHeaderMap :: MVar (Map Header ByteString),
-    httpConnectionResponseCookieMap :: MVar (Map String Cookie)
+    httpConnectionResponseCookieMap :: MVar (Map String Cookie),
+    httpConnectionResponseContentBuffer :: MVar ByteString,
+    httpConnectionResponseContentParameters :: MVar ResponseContentParameters
   }
 
 
@@ -198,6 +202,13 @@ data RequestContentParameters
   | RequestContentClosed
   | RequestContentIdentity Int
   | RequestContentChunked Bool Int
+
+data ResponseContentParameters
+  = ResponseContentUninitialized
+  | ResponseContentClosed
+  | ResponseContentBufferedIdentity
+  | ResponseContentUnbufferedIdentity Int
+  | ResponseContentChunked
 
 
 data Cookie = Cookie {
@@ -445,9 +456,12 @@ requestLoop socket peer handler = do
   requestContentBufferMVar <- liftIO $ newEmptyMVar
   requestContentParametersMVar <- liftIO $ newEmptyMVar
   responseHeadersSentMVar <- liftIO $ newEmptyMVar
+  responseHeadersModifiableMVar <- liftIO $ newEmptyMVar
   responseStatusMVar <- liftIO $ newEmptyMVar
   responseHeaderMapMVar <- liftIO $ newEmptyMVar
   responseCookieMapMVar <- liftIO $ newEmptyMVar
+  responseContentBufferMVar <- liftIO $ newEmptyMVar
+  responseContentParametersMVar <- liftIO $ newEmptyMVar
   let connection = HTTPConnection {
                      httpConnectionSocket = socket,
                      httpConnectionPeer = peer,
@@ -465,9 +479,15 @@ requestLoop socket peer handler = do
                        = requestContentParametersMVar,
                      httpConnectionResponseHeadersSent
                        = responseHeadersSentMVar,
+                     httpConnectionResponseHeadersModifiable
+                       = responseHeadersModifiableMVar,
                      httpConnectionResponseStatus = responseStatusMVar,
                      httpConnectionResponseHeaderMap = responseHeaderMapMVar,
-                     httpConnectionResponseCookieMap = responseCookieMapMVar
+                     httpConnectionResponseCookieMap = responseCookieMapMVar,
+                     httpConnectionResponseContentBuffer
+                       = responseContentBufferMVar,
+                     httpConnectionResponseContentParameters
+                       = responseContentParametersMVar
                    }
       requestLoop' = do
         httpCatch requestLoop''
@@ -508,9 +528,13 @@ requestLoop socket peer handler = do
             liftIO $ putMVar requestContentParametersMVar
                              RequestContentUninitialized
             liftIO $ putMVar responseHeadersSentMVar False
+            liftIO $ putMVar responseHeadersModifiableMVar True
             liftIO $ putMVar responseStatusMVar 200
             liftIO $ putMVar responseHeaderMapMVar Map.empty
             liftIO $ putMVar responseCookieMapMVar Map.empty
+            liftIO $ putMVar responseContentBufferMVar BS.empty
+            liftIO $ putMVar responseContentParametersMVar
+                             ResponseContentUninitialized
             httpCatch
               (do
                 valid <- getRequestValid
@@ -528,7 +552,10 @@ requestLoop socket peer handler = do
                    then return ()
                    else setResponseStatus 500)
             logAccess
-            httpCloseOutput
+            isWritable <- httpIsWritable
+            if isWritable
+              then httpCloseOutput
+              else return ()
             liftIO $ takeMVar timestampMVar
             liftIO $ takeMVar queryStringMVar
             liftIO $ takeMVar requestMethodMVar
@@ -538,9 +565,12 @@ requestLoop socket peer handler = do
             liftIO $ takeMVar requestContentBufferMVar
             liftIO $ takeMVar requestContentParametersMVar
             liftIO $ takeMVar responseHeadersSentMVar
+            liftIO $ takeMVar responseHeadersModifiableMVar
             liftIO $ takeMVar responseStatusMVar
             liftIO $ takeMVar responseHeaderMapMVar
             liftIO $ takeMVar responseCookieMapMVar
+            liftIO $ takeMVar responseContentBufferMVar
+            liftIO $ takeMVar responseContentParametersMVar
             requestLoop'''
   state <- ask
   liftIO $ flip runReaderT
@@ -1675,7 +1705,7 @@ getRequestContentAllowed = do
 --   available, blocks until there is some.  If output has been closed, causes
 --   an 'OutputAlreadyClosed' exception.
 httpGet :: (MonadHTTP m) => Int -> m BS.ByteString
-httpGet size = httpGet' (Just size) True
+httpGet size = httpGet' (Just size) True False
 
 
 -- | Reads up to a specified amount of data from the content of the HTTP
@@ -1685,7 +1715,7 @@ httpGet size = httpGet' (Just size) True
 --   if there is none, never blocking.  If output has been closed, causes an
 --   'OutputAlreadyClosed' exception.
 httpGetNonBlocking :: (MonadHTTP m) => Int -> m BS.ByteString
-httpGetNonBlocking size = httpGet' (Just size) False
+httpGetNonBlocking size = httpGet' (Just size) False False
 
 
 -- | Reads all remaining data from the content of the HTTP request, if any,
@@ -1693,7 +1723,7 @@ httpGetNonBlocking size = httpGet' (Just size) False
 --   read.  If input has been closed, returns an empty bytestring.  If output
 --   has been closed, causes an 'OutputAlreadyClosed' exception.
 httpGetContents :: (MonadHTTP m) => m BS.ByteString
-httpGetContents = httpGet' Nothing True
+httpGetContents = httpGet' Nothing True False
 
 
 -- | Returns whether the content of the HTTP request potentially has data
@@ -1711,9 +1741,11 @@ httpIsReadable = do
              _ -> True
 
 
-httpGet' :: (MonadHTTP m) => (Maybe Int) -> Bool -> m BS.ByteString
-httpGet' maybeSize blocking = do
-  requireOutputNotYetClosed
+httpGet' :: (MonadHTTP m) => (Maybe Int) -> Bool -> Bool -> m BS.ByteString
+httpGet' maybeSize blocking discarding = do
+  if not discarding
+    then requireOutputNotYetClosed
+    else return ()
   HTTPConnection {
       httpConnectionRequestContentBuffer = bufferMVar,
       httpConnectionRequestContentParameters = parametersMVar
@@ -1791,18 +1823,21 @@ extendRequestContentBuffer buffer parameters maybeTargetLength blocking = do
               RequestContentChunked _ _ -> do
                  httpLog $ "Don't understand chunked."
                  httpThrow UnexpectedEndOfInput
+                 -- TODO
   loop buffer parameters
 
 
--- | Sets the response status which will be sent with the response headers.  If the
---   response headers have already been sent, causes a 'ResponseHeadersAlreadySent'
---   exception.
+-- | Sets the response status which will be sent with the response headers.  If
+--   the response headers have already been sent, or are no longer modifiable
+--   (because of a call to 'httpPut' or similar), causes a
+--   'ResponseHeadersAlreadySent' or 'ResponseHeadersNotModifiable' exception.
 setResponseStatus
     :: (MonadHTTP m)
     => Int -- ^ The HTTP/1.1 status code to set.
     -> m ()
 setResponseStatus status = do
   requireResponseHeadersNotYetSent
+  requireResponseHeadersModifiable
   HTTPConnection { httpConnectionResponseStatus = mvar } <- getHTTPConnection
   liftIO $ swapMVar mvar status
   return ()
@@ -1819,14 +1854,17 @@ getResponseStatus = do
   liftIO $ readMVar mvar
 
 
--- | Sets the given 'HttpHeader' response header to the given string value, overriding
---   any value which has previously been set.  If the response headers have already
---   been sent, causes a 'ResponseHeadersAlreadySent' exception.  If the header is not
---   an HTTP/1.1 or extension response, entity, or general header, ie, is not
---   valid as part of a response, causes a 'NotAResponseHeader' exception.
+-- | Sets the given 'HttpHeader' response header to the given string value,
+--   overriding any value which has previously been set.  If the response
+--   headers have already been sent, or are no longer modifiable (because of a
+--   call to 'httpPut' or similar), causes a 'ResponseHeadersAlreadySent'
+--   or 'ResponseHeadersNotModifiable'
+--   exception.  If the header is not an HTTP/1.1 or extension response,
+--   entity, or general header, ie, is not valid as part of a response, causes
+--   a 'NotAResponseHeader' exception.
 --   
---   If a value is set for the 'HttpSetCookie' header, this overrides all cookies set
---   for this request with 'setCookie'.
+--   If a value is set for the 'HttpSetCookie' header, this overrides all
+--   cookies set for this request with 'setCookie'.
 setResponseHeader
     :: (MonadHTTP m)
     => Header -- ^ The header to set.  Must be a response header or an entity header.
@@ -1834,6 +1872,7 @@ setResponseHeader
     -> m ()
 setResponseHeader header value = do
   requireResponseHeadersNotYetSent
+  requireResponseHeadersModifiable
   if isValidInResponse header
     then do
       HTTPConnection { httpConnectionResponseHeaderMap = mvar } <- getHTTPConnection
@@ -1843,20 +1882,24 @@ setResponseHeader header value = do
     else httpThrow $ NotAResponseHeader header
 
 
--- | Causes the given 'HttpHeader' response header not to be sent, overriding any value
---   which has previously been set.  If the response headers have already been sent,
---   causes a 'ResponseHeadersAlreadySent' exception.  If the header is not an HTTP/1.1
---   or extension response or entity header, ie, is not valid as part of a response,
---   causes a 'NotAResponseHeader' exception.
+-- | Causes the given 'HttpHeader' response header not to be sent, overriding
+--   any value which has previously been set.  If the response headers have
+--   already been sent, or are no longer modifiable (because of a call to
+--   'httpPut' or similar), causes a 'ResponseHeadersAlreadySent' or
+--   'ResponseHeadersNotModifiable' exception.  If
+--   the header is not an HTTP/1.1 or extension response or entity header, ie,
+--   is not valid as part of a response, causes a 'NotAResponseHeader'
+--   exception.
 --   
---   Does not prevent the 'HttpSetCookie' header from being sent if cookies have been
---   set for this request with 'setCookie'.
+--   Does not prevent the 'HttpSetCookie' header from being sent if cookies
+--   have been set for this request with 'setCookie'.
 unsetResponseHeader
     :: (MonadHTTP m)
     => Header -- ^ The header to unset.  Must be a response header or an entity header.
     -> m ()
 unsetResponseHeader header = do
   requireResponseHeadersNotYetSent
+  requireResponseHeadersModifiable
   if isValidInResponse header
     then do
       HTTPConnection { httpConnectionResponseHeaderMap = mvar } <- getHTTPConnection
@@ -1866,17 +1909,16 @@ unsetResponseHeader header = do
     else httpThrow $ NotAResponseHeader header
 
 
--- | Returns the value of the given header which will be or has been sent with the
---   response headers.  If the header is not an HTTP/1.1 or extension response,
---   entity, or general header, ie, is not valid as part of a response, causes
---   a 'NotAResponseHeader' exception.
+-- | Returns the value of the given header which will be or has been sent with
+--   the response headers.  If the header is not an HTTP/1.1 or extension
+--   response, entity, or general header, ie, is not valid as part of a
+--   response, causes a 'NotAResponseHeader' exception.
 getResponseHeader
     :: (MonadHTTP m)
     => Header -- ^ The header to query.  Must be a response header or an entity
               --   header.
     -> m (Maybe String) -- ^ The value of the queried header.
 getResponseHeader header = do
-  requireResponseHeadersNotYetSent
   if isValidInResponse header
     then do
       HTTPConnection { httpConnectionResponseHeaderMap = mvar } <- getHTTPConnection
@@ -1885,13 +1927,14 @@ getResponseHeader header = do
     else httpThrow $ NotAResponseHeader header
 
 
--- | Causes the user agent to record the given cookie and send it back with future
---   loads of this page.  Does not take effect instantly, but rather when headers are
---   sent.  Cookies are set in accordance with RFC 2109.
---   If an @HttpCookie@ header is set for this request by a call to 'setResponseHeader',
---   this function has no effect.
---   If the response headers have already been sent,
---   causes a 'ResponseHeadersAlreadySent' exception.
+-- | Causes the user agent to record the given cookie and send it back with
+--   future loads of this page.  Does not take effect instantly, but rather
+--   when headers are sent.  Cookies are set in accordance with RFC 2109.
+--   If an @HttpCookie@ header is set for this request by a call to
+--   'setResponseHeader', this function has no effect.  If the response headers
+--   have already been sent, or are no longer modifiable (because of a call to
+--   'httpPut' or similar), causes a 'ResponseHeadersAlreadySent' or
+--   'ResponseHeadersNotModifiable' exception.
 --   If the name is not a possible name for a cookie, causes a 'CookieNameInvalid'
 --   exception.
 setCookie
@@ -1900,6 +1943,7 @@ setCookie
     -> m ()
 setCookie cookie = do
   requireResponseHeadersNotYetSent
+  requireResponseHeadersModifiable
   requireValidCookieName $ cookieName cookie
   {-
   HTTPConnection { request = Just request } <- getHTTPConnection
@@ -1912,19 +1956,21 @@ setCookie cookie = do
 
 
 -- | Causes the user agent to unset any cookie applicable to this page with the
---   given name.  Does not take effect instantly, but rather when headers are sent.
---   If an @HttpCookie@ header is set for this request by a call to 'setResponseHeader',
---   this function has no effect.
---   If the response headers have already been sent,
---   causes a 'ResponseHeadersAlreadySent' exception.
---   If the name is not a possible name for a cookie, causes a 'CookieNameInvalid'
---   exception.
+--   given name.  Does not take effect instantly, but rather when headers are
+--   sent.  If an @HttpCookie@ header is set for this request by a call to
+--   'setResponseHeader', this function has no effect.  If the response headers
+--   have already been sent, or are no longer modifiable (because of a call to
+--   'httpPut' or similar), causes a 'ResponseHeadersAlreadySent' or
+--   'ResponseHeadersNotModifiable' exception.
+--   If the name is not a possible name for a cookie, causes a
+--   'CookieNameInvalid' exception.
 unsetCookie
     :: (MonadHTTP m)
     => String -- ^ The name of the cookie to unset.
     -> m ()
 unsetCookie name = do
   requireResponseHeadersNotYetSent
+  requireResponseHeadersModifiable
   requireValidCookieName name
   {-
   HTTPConnection { request = Just request } <- getHTTPConnection
@@ -2012,9 +2058,16 @@ data HTTPException
     = ResponseHeadersAlreadySent
       -- ^ An exception thrown by operations which require the response headers not
       --   to have been sent yet.
+    | ResponseHeadersNotModifiable
+      -- ^ An exception thrown by operations which require the response headers
+      --   to still be modifiable.
     | OutputAlreadyClosed
       -- ^ An exception thrown by operations which produce output when output has
       --   been closed, as by 'httpCloseOutput'.
+    | OutputIncomplete
+      -- ^ An exception thrown when output is closed, as by 'httpCloseOutput',
+      --   when the response headers imply that there will be a certain amount
+      --   of data and there is not.
     | NotAResponseHeader Header
       -- ^ An exception thrown by operations which are given a header that does not
       --   meet their requirement of being valid in a response.
@@ -2027,11 +2080,13 @@ data HTTPException
 instance Exception.Exception HTTPException
 
 
--- | Sets the HTTP/1.1 return status to 301 and sets the 'HttpLocation' header to
---   the provided URL.  This has the effect of issuing a permanent redirect to the
---   user agent.  Permanent redirects, as opposed to temporary redirects, may cause
---   bookmarks or incoming links to be updated.  If the response headers have already
---   been sent, causes a 'ResponseHeadersAlreadySent' exception.
+-- | Sets the HTTP/1.1 return status to 301 and sets the 'HttpLocation' header
+--   to the provided URL.  This has the effect of issuing a permanent redirect
+--   to the user agent.  Permanent redirects, as opposed to temporary redirects,
+--   may cause bookmarks or incoming links to be updated.  If the response
+--   headers have already been sent, or are no longer modifiable (because of a
+--   call to 'httpPut' or similar), causes a 'ResponseHeadersAlreadySent' or
+--   'ResponseHeadersNotModifiable' exception.
 permanentRedirect
     :: (MonadHTTP m)
     => String -- ^ The URL to redirect to, as a string.
@@ -2041,11 +2096,13 @@ permanentRedirect url = do
   setResponseHeader HttpLocation url
 
 
--- | Sets the HTTP/1.1 return status to 303 and sets the 'HttpLocation' header to
---   the provided URL.  This has the effect of issuing a see-other or "temporary"
---   redirect to the user agent.  Temporary redirects, as opposed to permanent redirects,
---   do not cause bookmarks or incoming links to be updated.  If the response headers
---   have already been sent, causes a 'ResponseHeadersAlreadySent' exception.
+-- | Sets the HTTP/1.1 return status to 303 and sets the 'HttpLocation' header
+--   to the provided URL.  This has the effect of issuing a see-other or
+--   "temporary" redirect to the user agent.  Temporary redirects, as opposed to
+--   permanent redirects, do not cause bookmarks or incoming links to be
+--   updated.  If the response headers have already been sent, or are no longer
+--   modifiable (because of a call to 'httpPut' or similar), causes a
+--   'ResponseHeadersAlreadySent' or 'ResponseHeadersNotModifiable' exception.
 seeOtherRedirect
     :: (MonadHTTP m)
     => String -- ^ The URL to redirect to, as a string.
@@ -2055,15 +2112,16 @@ seeOtherRedirect url = do
   setResponseHeader HttpLocation url
 
 
--- | Ensures that the response headers have been sent.  If they are already sent, does
---   nothing.  If output has already been closed, causes an 'OutputAlreadyClosed'
---   exception.
+-- | Ensures that the response headers have been sent.  If they are already
+--   sent, does nothing.  If output has already been closed, causes an
+--   'OutputAlreadyClosed' exception.
 sendResponseHeaders :: (MonadHTTP m) => m ()
 sendResponseHeaders = do
   requireOutputNotYetClosed
   HTTPConnection {
       httpConnectionSocket = socket,
       httpConnectionResponseHeadersSent = alreadySentMVar,
+      httpConnectionResponseHeadersModifiable = modifiableMVar,
       httpConnectionResponseStatus = responseStatusMVar,
       httpConnectionResponseHeaderMap = responseHeaderMapMVar,
       httpConnectionResponseCookieMap = responseCookieMapMVar
@@ -2071,6 +2129,7 @@ sendResponseHeaders = do
   alreadySent <- liftIO $ takeMVar alreadySentMVar
   if not alreadySent
     then do
+      liftIO $ swapMVar modifiableMVar False
       responseStatus <- liftIO $ readMVar responseStatusMVar
       responseHeaderMap <- liftIO $ readMVar responseHeaderMapMVar
       responseCookieMap <- liftIO $ readMVar responseCookieMapMVar
@@ -2098,6 +2157,14 @@ sendResponseHeaders = do
       liftIO $ Network.sendAll socket buffer
     else return ()
   liftIO $ putMVar alreadySentMVar True
+
+
+markResponseHeadersUnmodifiable :: (MonadHTTP m) => m ()
+markResponseHeadersUnmodifiable = do
+  HTTPConnection { httpConnectionResponseHeadersModifiable = modifiableMVar }
+    <- getHTTPConnection
+  liftIO $ swapMVar modifiableMVar False
+  return ()
 
 
 reasonPhrase :: Int -> ByteString
@@ -2146,57 +2213,214 @@ reasonPhrase status =
                       _ -> "Extension"
 
 
--- | Returns whether the response headers have been sent.
+-- | Returns whether the response headers have been sent, regardless of whether
+--   they are modifiable (they might not be because of a call to 'httpPut' or
+--   similar).
 responseHeadersSent :: (MonadHTTP m) => m Bool
 responseHeadersSent = do
-  HTTPConnection { httpConnectionResponseHeadersSent = mvar } <- getHTTPConnection
+  HTTPConnection { httpConnectionResponseHeadersSent = mvar }
+    <- getHTTPConnection
   liftIO $ readMVar mvar
 
 
--- | Sends data.  This is the content data of the HTTP response.  If the response
---   headers have not been sent, first sends them.  If output has already been closed,
---   causes an 'OutputAlreadyClosed' exception.
+-- | Returns whether the response headers are modifiable, a prerequisite of
+--   which is that they have not already been sent.  (They might not be
+--   modifiable because of a call to 'httpPut' or similar.)
+responseHeadersModifiable :: (MonadHTTP m) => m Bool
+responseHeadersModifiable = do
+  HTTPConnection { httpConnectionResponseHeadersModifiable = mvar }
+    <- getHTTPConnection
+  liftIO $ readMVar mvar
+
+
+-- | Appends data, interpreted as binary, to the content of the HTTP response.
+--   Makes the response headers no longer modifiable, effective immediately.
+--   If output has already been closed, causes an 'OutputAlreadyClosed'
+--   exception.  If the response Transfer-Encoding as set in the response
+--   headers is "identity" or omitted, and the response Content-Length is
+--   omitted, data is buffered until output is closed, then sent all at once
+--   with an appropriate Content-Length header.  Otherwise - that is, if there
+--   is a Transfer-Encoding other than "identity" set, or if Content-Length is
+--   set - data is sent immediately.  If Content-Length is set, and the
+--   provided data would cause the cumulative data sent to exceed that length,
+--   causes an 'OutputAlreadyClosed' exception.  At the time that data is
+--   actually sent, if the response headers have not been sent, first sends
+--   them.
+--   
+--   In other words, there are effectively three modes of operation for output.
+--   The first, simplest mode is used if the handler does nothing special.  In
+--   this mode output is buffered and sent all at once; headers are not sent
+--   until this time.  In this mode 'httpCloseOutput' may be useful to force
+--   output to be sent before the handler returns, perhaps so that additional
+--   time-consuming processing can be done.  This mode is easiest to use, in the
+--   sense that it requires no support on the handler's part, but probably the
+--   second mode should always be used instead.
+--   
+--   The second mode is used if the handler sets a Transfer-Encoding, for
+--   example "chunked", and no Content-Length.  In this case headers are sent
+--   immediately upon the first 'httpPut' or 'httpPutStr', and output is sent
+--   as it is provided.  Output in this mode is transformed by 'httpPut' into
+--   the appropriate transfer encoding.  Thus handler code need only specify a
+--   transfer encoding, not actually implement that encoding itself.  This mode
+--   is advantageous to allow user agents to begin displaying partial content as
+--   it is received, and particularly useful when the content is quite large
+--   or takes significant time to generate.  If you are unsure which mode to
+--   use, it should probably be this one.
+--   
+--   The third mode is used if the handler sets a Content-Length and no
+--   Transfer-Encoding.  In this case headers are again sent immediately upon
+--   the first 'httpPut' or 'httpPutStr', and output is again sent as it is
+--   provided.  Output in this mode is not transformed.  This may be more
+--   efficient than the second mode if output is generated in many small pieces,
+--   as it avoids computing and sending the length tags of the "chunked"
+--   encoding.  However, it requires the content length to be known in advance
+--   of actually sending any content.  It may be useful if you wish to have
+--   direct-http validate that the handler is well-behaved in sending a binary
+--   object of known size with no "garbage" inserted by spurious additional
+--   puts.
 httpPut :: (MonadHTTP m) => BS.ByteString -> m ()
-httpPut buffer = do
+httpPut bytestring = do
   requireOutputNotYetClosed
-  sendResponseHeaders
-  return ()
-  -- TODO
+  markResponseHeadersUnmodifiable
+  HTTPConnection {
+      httpConnectionResponseContentBuffer = bufferMVar,
+      httpConnectionResponseContentParameters = parametersMVar
+    } <- getHTTPConnection
+  buffer <- liftIO $ takeMVar bufferMVar
+  parameters <- liftIO $ takeMVar parametersMVar
+  parameters <- ensureResponseContentParametersInitialized parameters
+  (buffer, parameters) <- case parameters of
+    ResponseContentClosed -> httpThrow OutputAlreadyClosed
+    ResponseContentBufferedIdentity -> do
+      return (BS.append buffer bytestring, ResponseContentBufferedIdentity)
+    ResponseContentUnbufferedIdentity lengthRemaining -> do
+      sendResponseHeaders
+      let lengthThisPut = BS.length bytestring
+      if lengthThisPut > lengthRemaining
+        then do
+          liftIO $ putMVar parametersMVar ResponseContentClosed
+          liftIO $ putMVar bufferMVar BS.empty
+          httpThrow OutputAlreadyClosed
+        else do
+          let parameters' = ResponseContentUnbufferedIdentity
+                             $ lengthRemaining - lengthThisPut
+          send bytestring
+          return (buffer, parameters')
+    ResponseContentChunked -> do
+      httpLog $ "Chunked not implemented."
+      liftIO $ putMVar parametersMVar parameters
+      liftIO $ putMVar bufferMVar buffer
+      httpThrow UnexpectedEndOfInput
+      -- TODO
+  liftIO $ putMVar parametersMVar parameters
+  liftIO $ putMVar bufferMVar buffer
 
 
--- | Sends text, encoded as UTF-8.  This is the content data of the HTTP response.
---   if the response headers have not been sent, first sends them.  If output has
---   already been closed, causes an 'OutputAlreadyClosed' exception.
+ensureResponseContentParametersInitialized
+  :: (MonadHTTP m)
+  => ResponseContentParameters
+  -> m ResponseContentParameters
+ensureResponseContentParametersInitialized ResponseContentUninitialized = do
+  maybeLengthString <- getResponseHeader HttpContentLength
+  let maybeLength = case maybeLengthString of
+                      Nothing -> Nothing
+                      Just lengthString -> parseInt lengthString
+  maybeTransferEncodingString <- getResponseHeader HttpTransferEncoding
+  let (hasContent, chunked)
+        = case (maybeLengthString, maybeTransferEncodingString) of
+            (Nothing, Nothing) -> (False, False)
+            (Just length, Nothing) -> (True, False)
+            (Just length, Just encoding)
+              | map toLower encoding == "identity" -> (True, False)
+              | otherwise -> (True, True)
+            (_, Just _) -> (True, True)
+  if hasContent
+    then if chunked
+           then return $ ResponseContentChunked
+           else return $ ResponseContentUnbufferedIdentity
+                          $ fromJust maybeLength
+    else return ResponseContentBufferedIdentity
+ensureResponseContentParametersInitialized parameters = return parameters
+
+
+flushResponseContent :: (MonadHTTP m) => m ()
+flushResponseContent = do
+  HTTPConnection {
+      httpConnectionResponseContentBuffer = bufferMVar,
+      httpConnectionResponseContentParameters = parametersMVar
+    } <- getHTTPConnection
+  buffer <- liftIO $ takeMVar bufferMVar
+  parameters <- liftIO $ takeMVar parametersMVar
+  parameters <- ensureResponseContentParametersInitialized parameters
+  case parameters of
+    ResponseContentClosed -> httpThrow OutputAlreadyClosed
+    ResponseContentBufferedIdentity -> do
+      send buffer
+      return ()
+    ResponseContentUnbufferedIdentity lengthRemaining -> do
+      if lengthRemaining > 0
+        then do
+          liftIO $ putMVar parametersMVar ResponseContentClosed
+          liftIO $ putMVar bufferMVar BS.empty
+          httpThrow OutputIncomplete
+        else return ()
+    ResponseContentChunked -> do
+      httpLog $ "Chunked not implemented."
+      liftIO $ putMVar parametersMVar parameters
+      liftIO $ putMVar bufferMVar buffer
+      httpThrow UnexpectedEndOfInput
+      -- TODO
+  liftIO $ putMVar parametersMVar ResponseContentClosed
+  liftIO $ putMVar bufferMVar BS.empty
+
+
+send :: (MonadHTTP m) => ByteString -> m ()
+send bytestring = do
+  HTTPConnection { httpConnectionSocket = socket } <- getHTTPConnection
+  httpCatch (liftIO $ Network.sendAll socket bytestring)
+            (\e -> do
+               return (e :: Exception.SomeException)
+               return ())
+
+
+-- | Appends text, encoded as UTF8, to the content of the HTTP response.  In
+--   all respects this behaves as 'httpPut', but for the fact that it takes
+--   text rather than binary data.
 httpPutStr :: (MonadHTTP m) => String -> m ()
 httpPutStr string = httpPut $ UTF8.fromString string
 
 
--- | Informs the web server and the user agent that the request has completed.  As
---   side-effects, the response headers are sent if they have not yet been, and
---   any unread input is discarded and no more can be read.  This is
---   implicitly called, if it has not already been, after the handler returns; it
---   may be useful within a handler if the handler wishes to return results and then
---   perform time-consuming computations before exiting.  If output has already been
---   closed, causes an 'OutputAlreadyClosed' exception.
+-- | Informs the web server and the user agent that the request has completed.
+--   As side-effects, the response headers are sent if they have not yet been,
+--   any unread input is discarded and no more can be read, and any unsent
+--   output is sent.  This is implicitly called, if it has not already been,
+--   after the handler returns; it may be useful within a handler if the
+--   handler wishes to return results and then perform time-consuming
+--   computations before exiting.  If output has already been closed, causes an
+--   'OutputAlreadyClosed' exception.  If the response headers imply that there
+--   will be a certain amount of data and there is not, causes an
+--   'OutputIncomplete' exception.
 httpCloseOutput :: (MonadHTTP m) => m ()
 httpCloseOutput = do
   requireOutputNotYetClosed
   sendResponseHeaders
-  httpGetContents
+  flushResponseContent
+  httpGet' Nothing True True
   return ()
 
 
--- | Returns whether it is possible to write more data; ie, whether output has not
---   yet been closed as by 'httpCloseOutput'.
+-- | Returns whether it is possible to write more data; ie, whether output has
+--   not yet been closed as by 'httpCloseOutput'.
 httpIsWritable :: (MonadHTTP m) => m Bool
 httpIsWritable = do
-  {-
-  HTTPConnection { request = Just request } <- getHTTPConnection
-  requestEnded <- liftIO $ readMVar $ requestEndedMVar request
-  return $ not requestEnded
-  -}
-  return False
-  -- TODO
+  HTTPConnection { httpConnectionResponseContentParameters = parametersMVar }
+    <- getHTTPConnection
+  parameters <- liftIO $ takeMVar parametersMVar
+  parameters <- ensureResponseContentParametersInitialized parameters
+  liftIO $ putMVar parametersMVar parameters
+  return $ case parameters of
+             ResponseContentClosed -> False
+             _ -> True
 
 
 requireResponseHeadersNotYetSent :: (MonadHTTP m) => m ()
@@ -2207,17 +2431,20 @@ requireResponseHeadersNotYetSent = do
     else return ()
 
 
+requireResponseHeadersModifiable :: (MonadHTTP m) => m ()
+requireResponseHeadersModifiable = do
+  modifiable <- responseHeadersModifiable
+  if modifiable
+    then return ()
+    else httpThrow ResponseHeadersNotModifiable
+
+
 requireOutputNotYetClosed :: (MonadHTTP m) => m ()
 requireOutputNotYetClosed = do
-  {-
-  HTTPConnection { request = Just request } <- getHTTPConnection
-  requestEnded <- liftIO $ readMVar $ requestEndedMVar request
-  if requestEnded
-    then httpThrow OutputAlreadyClosed
-    else return ()
-   -}
-  return ()
-  -- TODO
+  isWritable <- httpIsWritable
+  case isWritable of
+    False -> httpThrow OutputAlreadyClosed
+    True -> return ()
 
 
 -- | Throw an exception in any 'MonadHTTP' monad.
