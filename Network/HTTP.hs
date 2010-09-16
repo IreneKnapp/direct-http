@@ -807,7 +807,8 @@ recvHeaders :: (MonadHTTP m)
                             ByteString,
                             Map Header ByteString))
 recvHeaders = do
-  HTTPConnection { httpConnectionInputBufferMVar = inputBufferMVar } <- getHTTPConnection
+  HTTPConnection { httpConnectionInputBufferMVar = inputBufferMVar }
+    <- getHTTPConnection
   inputBuffer <- liftIO $ takeMVar inputBufferMVar
   (inputBuffer, maybeLine) <- recvLine inputBuffer
   result <- case maybeLine of
@@ -826,12 +827,12 @@ recvHeaders = do
             && (isValidURL url)
             && (isValidProtocol protocol)
           -> do
-            let loop headersSoFar = do
+            let loop inputBuffer headersSoFar = do
                   (inputBuffer, maybeLine) <- recvLine inputBuffer
                   case maybeLine of
                     Nothing -> return Nothing
                     Just line
-                      | line == BS.empty -> do
+                      | BS.null line -> do
                           return $ Just (method, url, protocol, headersSoFar)
                       | otherwise -> do
                           case parseHeader line of
@@ -851,8 +852,8 @@ recvHeaders = do
                                                         (UTF8.fromString ","),
                                                         value])
                                             headersSoFar
-                              loop headersSoFar'
-            loop Map.empty
+                              loop inputBuffer headersSoFar'
+            loop inputBuffer Map.empty
         _ -> do
           logInvalidRequest
           return Nothing
@@ -900,20 +901,22 @@ isValidProtocol bytestring
 
 recvLine :: (MonadHTTP m) => ByteString -> m (ByteString, Maybe ByteString)
 recvLine inputBuffer = do
-  let loop inputBuffer length = do
+  let loop inputBuffer length firstIteration = do
+        let blocking = not firstIteration
         (inputBuffer, endOfInput)
-          <- extendInputBuffer inputBuffer length False
+          <- extendInputBuffer inputBuffer length blocking
         let (before, after)
               = BS.breakSubstring (UTF8.fromString "\r\n") inputBuffer
         if BS.null after
           then if endOfInput
                  then return (inputBuffer, Nothing)
-                 else loop inputBuffer $ length + 80
-          else do
-            let result = before
-                inputBuffer = BS.drop 2 after
-            return (inputBuffer, Just result)
-  loop inputBuffer 80
+                 else loop inputBuffer (length + 80) False
+          else return (BS.drop 2 after, Just before)
+  let (before, after)
+        = BS.breakSubstring (UTF8.fromString "\r\n") inputBuffer
+  if BS.null after
+    then loop inputBuffer 80 True
+    else return (BS.drop 2 after, Just before)
 
 
 recvBlock :: (MonadHTTP m) => Int -> m ByteString
@@ -1793,38 +1796,54 @@ extendRequestContentBuffer
   -> (Maybe Int)
   -> Bool
   -> m (BS.ByteString, RequestContentParameters)
-extendRequestContentBuffer buffer parameters maybeTargetLength blocking = do
+extendRequestContentBuffer highLevelBuffer
+                           parameters
+                           maybeTargetLength
+                           blocking = do
   let isAtLeastTargetLength buffer =
         case maybeTargetLength of
           Nothing -> False
           Just targetLength -> BS.length buffer >= targetLength
-      loop buffer parameters = do
-        if isAtLeastTargetLength buffer
-          then return (buffer, parameters)
+      loop highLevelBuffer lowLevelBuffer parameters = do
+        if isAtLeastTargetLength highLevelBuffer
+          then return (highLevelBuffer, lowLevelBuffer, parameters)
           else do
             case parameters of
-              RequestContentNone -> return (buffer, parameters)
-              RequestContentClosed -> return (buffer, parameters)
+              RequestContentNone
+                -> return (highLevelBuffer, lowLevelBuffer, parameters)
+              RequestContentClosed
+                -> return (highLevelBuffer, lowLevelBuffer, parameters)
               RequestContentIdentity lengthRemaining -> do
-                (buffer, endOfInput)
-                  <- extendInputBuffer buffer lengthRemaining blocking
+                (lowLevelBuffer, endOfInput)
+                  <- extendInputBuffer lowLevelBuffer lengthRemaining blocking
                 if endOfInput
                   then httpThrow UnexpectedEndOfInput
                   else return ()
-                let lengthRemaining' = if lengthRemaining > BS.length buffer
-                                         then lengthRemaining - BS.length buffer
+                let (toHighLevelBuffer, lowLevelBuffer')
+                      = BS.splitAt lengthRemaining lowLevelBuffer
+                    lengthRead = BS.length toHighLevelBuffer
+                    highLevelBuffer'
+                      = BS.append highLevelBuffer toHighLevelBuffer
+                    lengthRemaining' = if lengthRemaining > lengthRead
+                                         then lengthRemaining - lengthRead
                                          else 0
                     parameters' = if lengthRemaining' > 0
                                     then RequestContentIdentity lengthRemaining'
                                     else RequestContentClosed
-                if not blocking || isAtLeastTargetLength buffer
-                  then return (buffer, parameters')
-                  else loop buffer parameters'
+                if not blocking || isAtLeastTargetLength highLevelBuffer
+                  then return (highLevelBuffer', lowLevelBuffer', parameters')
+                  else loop highLevelBuffer' lowLevelBuffer' parameters'
               RequestContentChunked _ _ -> do
                  httpLog $ "Don't understand chunked."
                  httpThrow UnexpectedEndOfInput
                  -- TODO
-  loop buffer parameters
+  HTTPConnection { httpConnectionInputBufferMVar = lowLevelBufferMVar }
+    <- getHTTPConnection
+  lowLevelBuffer <- liftIO $ takeMVar lowLevelBufferMVar
+  (highLevelBuffer, lowLevelBuffer, parameters)
+    <- loop highLevelBuffer lowLevelBuffer parameters
+  liftIO $ putMVar lowLevelBufferMVar lowLevelBuffer
+  return (highLevelBuffer, parameters)
 
 
 -- | Sets the response status which will be sent with the response headers.  If
