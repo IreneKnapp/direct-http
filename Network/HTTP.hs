@@ -384,6 +384,13 @@ acceptLoop parameters fork handler = do
            exitFailure)
   accessLogMaybeHandleMVar <- newMVar accessLogMaybeHandle
   errorLogMaybeHandleMVar <- newMVar errorLogMaybeHandle
+  let state = HTTPState {
+                httpStateAccessLogMaybeHandleMVar
+                  = accessLogMaybeHandleMVar,
+                httpStateErrorLogMaybeHandleMVar
+                  = errorLogMaybeHandleMVar,
+                httpStateMaybeConnection = Nothing
+              }
   if serverParametersDaemonize parameters
     then do
       let maybeHandleMVarToFd maybeHandleMVar = do
@@ -401,33 +408,28 @@ acceptLoop parameters fork handler = do
       errorLogMaybeFd <- maybeHandleMVarToFd errorLogMaybeHandleMVar
       listenSocketMaybeFd <- return $ Just
                                     $ POSIX.Fd $ Network.fdSocket listenSocket
-      daemonize $ defaultDaemonOptions {
-                    daemonFileDescriptorsToLeaveOpen
-                      = (map fromJust $ filter isJust [accessLogMaybeFd,
-                                                       errorLogMaybeFd,
-                                                       listenSocketMaybeFd]),
-                    daemonUserToChangeTo
-                      = serverParametersUserToChangeTo parameters,
-                    daemonGroupToChangeTo
-                      = serverParametersGroupToChangeTo parameters
-                  }
-    else return ()
-  let state = HTTPState {
-                httpStateAccessLogMaybeHandleMVar
-                  = accessLogMaybeHandleMVar,
-                httpStateErrorLogMaybeHandleMVar
-                  = errorLogMaybeHandleMVar,
-                httpStateMaybeConnection = Nothing
-              }
-  let acceptLoop' listenSocket = do
-        (socket, peer) <- liftIO $ Network.accept listenSocket
-        state <- ask
-        liftIO $ fork $ flip runReaderT state
-                        $ requestLoop socket peer handler
-        acceptLoop' listenSocket
-  flip runReaderT state $ do
-    httpLog $ "Server started."
-    acceptLoop' listenSocket
+      daemonize (defaultDaemonOptions {
+                   daemonFileDescriptorsToLeaveOpen
+                     = (map fromJust $ filter isJust [accessLogMaybeFd,
+                                                      errorLogMaybeFd,
+                                                      listenSocketMaybeFd]),
+                   daemonUserToChangeTo
+                     = serverParametersUserToChangeTo parameters,
+                   daemonGroupToChangeTo
+                     = serverParametersGroupToChangeTo parameters
+                 })
+                $ acceptLoop' state listenSocket
+    else acceptLoop' state listenSocket
+  where acceptLoop' state listenSocket = do
+          let acceptLoop'' = do
+                (socket, peer) <- liftIO $ Network.accept listenSocket
+                state <- ask
+                liftIO $ fork $ flip runReaderT state
+                         $ requestLoop socket peer handler
+                acceptLoop''
+          flip runReaderT state $ do
+            httpLog $ "Server started."
+            acceptLoop''
 
 
 createListenSocket :: IO Network.Socket
