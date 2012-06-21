@@ -1,14 +1,11 @@
-{-# LANGUAGE TypeSynonymInstances, FlexibleInstances, DeriveDataTypeable #-}
+{-# LANGUAGE TypeSynonymInstances, FlexibleInstances, FlexibleContexts,
+             DeriveDataTypeable #-}
 module Network.HTTP (
              -- * The monad
              HTTP,
              HTTPState,
              MonadHTTP,
              getHTTPState,
-             implementationThrowHTTP,
-             implementationCatchHTTP,
-             implementationBlockHTTP,
-             implementationUnblockHTTP,
              
              -- * Accepting requests
              HTTPServerParameters(..),
@@ -17,6 +14,12 @@ module Network.HTTP (
              
              -- * Logging
              httpLog,
+             
+             -- * Concurrency
+             httpFork,
+             
+             -- * Exceptions
+             HTTPException,
              
              -- * Request information
              -- | It is common practice for web servers to make their own
@@ -56,8 +59,6 @@ module Network.HTTP (
              getRemoteUser,
              getRequestMethod,
              getRequestURI,
-             getScriptFilename,
-             getScriptName,
              getServerAddress,
              getServerName,
              getServerPort,
@@ -120,29 +121,15 @@ module Network.HTTP (
              httpPut,
              httpPutStr,
              httpCloseOutput,
-             httpIsWritable,
-             
-             -- * Exceptions
-             --   Because it is not possible for user code to enter the HTTP
-             --   monad from outside it, catching exceptions in IO will not
-             --   work.  Therefore a full set of exception primitives designed
-             --   to work with any 'MonadHTTP' instance is provided.
-             HTTPException(..),
-             httpThrow,
-             httpCatch,
-             httpBlock,
-             httpUnblock,
-             httpBracket,
-             httpFinally,
-             httpTry,
-             httpHandle,
-             httpOnException
+             httpIsWritable
             )
     where
 
-import Control.Concurrent
-import qualified Control.Exception as Exception
+import Control.Concurrent.Lifted
+import Control.Exception.Lifted
+import Control.Monad.Base
 import Control.Monad.Reader
+import Control.Monad.Trans.Control
 import Data.Bits
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -152,6 +139,8 @@ import Data.List
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Time
 import Data.Time.Clock.POSIX
 import Data.Typeable
@@ -176,6 +165,9 @@ import qualified System.Posix as POSIX
 data HTTPState = HTTPState {
     httpStateAccessLogMaybeHandleMVar :: MVar (Maybe Handle),
     httpStateErrorLogMaybeHandleMVar :: MVar (Maybe Handle),
+    httpStateForkPrimitive :: IO () -> IO ThreadId,
+    httpStateThreadSetMVar :: MVar (Set ThreadId),
+    httpStateThreadTerminationQSem :: QSem,
     httpStateMaybeConnection :: Maybe HTTPConnection
   }
 
@@ -234,7 +226,7 @@ data ConnectionTerminatingError = UnexpectedEndOfInput
                                   deriving (Typeable)
 
 
-instance Exception.Exception ConnectionTerminatingError
+instance Exception ConnectionTerminatingError
 
 
 instance Show ConnectionTerminatingError where
@@ -242,68 +234,62 @@ instance Show ConnectionTerminatingError where
 
 
 -- | The monad within which each single request from a client is handled.
+--   
+--   Note that there is an instance 'MonadBaseControl' 'IO' 'HTTP', so that
+--   exceptions can be thrown, caught, and otherwise manipulated with the
+--   lifted primitives from lifted-base's 'Control.Exception.Lifted'.
 type HTTP = ReaderT HTTPState IO
 
 
--- | The class of monads within which the HTTP calls are valid.  You may wish to
---   create your own monad implementing this class.
-class (MonadIO m) => MonadHTTP m where
+-- | The class of monads within which the HTTP calls are valid.  You may wish
+--   to create your own monad implementing this class.  Note that the
+--   prerequisite is 'MonadBaseControl' 'IO' m, which is similar to
+--   'MonadIO' m, but with, among other things, more capability for
+--   exception handling.
+class (MonadBaseControl IO m) => MonadHTTP m where
     -- | Returns the opaque 'HTTPState' object representing the state of
     --   the HTTP server.
     --   Should not be called directly by user code, except implementations of
     --   'MonadHTTP'; exported so that
     --   user monads can implement the interface.
-    getHTTPState
-        :: m HTTPState
-    -- | Throws an exception in the monad.
-    --   Should not be called directly by user code; exported so that
-    --   user monads can implement the interface.  See 'httpThrow'.
-    implementationThrowHTTP
-        :: (Exception.Exception e)
-        => e -- ^ The exception to throw
-        -> m a
-    -- | Perform an action in the monad, with a given exception-handler action bound.
-    --   Should not be called directly by user code; exported so that
-    --   user monads can implement the interface.  See 'httpCatch'.
-    implementationCatchHTTP
-        :: (Exception.Exception e)
-        => m a -- ^ The action to run with the exception handler binding in scope.
-        -> (e -> m a) -- ^ The exception handler to bind.
-        -> m a
-    -- | Block exceptions within an action.
-    --   Should not be called directly by user code; exported so that
-    --   user monads can implement the interface.  See 'httpBlock'.
-    implementationBlockHTTP
-        :: m a -- ^ The action to run with exceptions blocked.
-        -> m a
-    -- | Unblock exceptions within an action.
-    --   Should not be called directly by user code; exported so that
-    --   user monads can implement the interface.  See 'httpUnblock'.
-    implementationUnblockHTTP
-        :: m a -- ^ The action to run with exceptions unblocked.
-        -> m a
+    getHTTPState :: m HTTPState
 
 
 instance MonadHTTP HTTP where
     getHTTPState = ask
-    implementationThrowHTTP exception = liftIO $ Exception.throwIO exception
-    implementationCatchHTTP action handler = do
-      state <- getHTTPState
-      liftIO $ Exception.catch (runReaderT action state)
-                               (\exception -> do
-                                  runReaderT (handler exception) state)
-    implementationBlockHTTP action = do
-      state <- getHTTPState
-      liftIO $ Exception.block (runReaderT action state)
-    implementationUnblockHTTP action = do
-      state <- getHTTPState
-      liftIO $ Exception.unblock (runReaderT action state)
 
 
 getHTTPConnection :: (MonadHTTP m) => m HTTPConnection
 getHTTPConnection = do
-  HTTPState { httpStateMaybeConnection = maybeConnection } <- getHTTPState
-  return $ fromJust maybeConnection
+  state <- getHTTPState
+  case httpStateMaybeConnection state of
+    Nothing -> throwIO NoConnection
+    Just connection -> return connection
+
+
+-- | Forks a thread to run the given action, using the forking primitive that
+--   was passed in the configuration to 'acceptLoop', and additionally
+--   registers that thread with the main server thread, which has the sole
+--   effect and purpose of causing the server to not exit until and unless the
+--   child thread does.  All of the listener-socket and connection threads
+--   created by the server go through this function.
+httpFork :: (MonadHTTP m) => m () -> m ThreadId
+httpFork action = do
+  state <- getHTTPState
+  let mvar = httpStateThreadSetMVar state
+      qsem = httpStateThreadTerminationQSem state
+  threadSet <- takeMVar mvar
+  childThread <- liftBaseDiscard (httpStateForkPrimitive state)
+    $ finally action
+              (do
+                threadSet <- takeMVar mvar
+                self <- myThreadId
+                let threadSet' = Set.delete self threadSet'
+                putMVar mvar threadSet'
+                signalQSem qsem)
+  let threadSet' = Set.insert childThread threadSet
+  putMVar mvar threadSet'
+  return childThread
 
 
 -- | A record used to configure the server.  Broken informally into the four
@@ -344,9 +330,16 @@ getHTTPConnection = do
 --   single-threaded operation.
 --   
 --   Notice that we take the forking primitive in terms of 'IO', even though
---   we actually lift it with 'liftBase'.  This is because lifted-base, as of
---   this writing and its version 0.1.1, only supports 'forkIO' and not
---   'forkOS'.
+--   we actually lift it (with 'liftBaseDiscard').  This is because
+--   lifted-base, as of this writing and its version 0.1.1, only supports
+--   'forkIO' and not 'forkOS'.
+--   
+--   The loop never returns, but will terminate the program with status 0 if
+--   and when it ever has no child threads alive; child threads for this
+--   purpose are those created through 'httpFork', which means all
+--   listener-socket and connection threads created by 'acceptLoop', as well
+--   as any threads created by client code through 'httpFork', but not threads
+--   created by client code through other mechanisms.
 --   
 --   The author of direct-http has made no effort to implement custom
 --   thread-pooling forking primitives, but has attempted not to preclude
@@ -396,7 +389,7 @@ acceptLoop
     -- ^ Never actually returns.
 acceptLoop parameters handler = do
   (listenSockets, accessLogMaybeHandle, errorLogMaybeHandle)
-    <- Exception.catch
+    <- catch
        (do
          listenSockets <-
            mapM createListenSocket (serverParametersListenSockets parameters)
@@ -416,15 +409,19 @@ acceptLoop parameters handler = do
         (\e -> do
            hPutStrLn stderr
                      $ "Failed to start: "
-                       ++ (show (e :: Exception.SomeException))
+                       ++ (show (e :: SomeException))
            exitFailure)
   accessLogMaybeHandleMVar <- newMVar accessLogMaybeHandle
   errorLogMaybeHandleMVar <- newMVar errorLogMaybeHandle
+  let forkPrimitive = serverParametersForkPrimitive parameters
+  threadSetMVar <- newMVar Set.empty
+  threadTerminationQSem <- newQSem 0
   let state = HTTPState {
-                httpStateAccessLogMaybeHandleMVar
-                  = accessLogMaybeHandleMVar,
-                httpStateErrorLogMaybeHandleMVar
-                  = errorLogMaybeHandleMVar,
+                httpStateAccessLogMaybeHandleMVar = accessLogMaybeHandleMVar,
+                httpStateErrorLogMaybeHandleMVar = errorLogMaybeHandleMVar,
+                httpStateForkPrimitive = forkPrimitive,
+                httpStateThreadSetMVar = threadSetMVar,
+                httpStateThreadTerminationQSem = threadTerminationQSem,
                 httpStateMaybeConnection = Nothing
               }
   if serverParametersDaemonize parameters
@@ -437,16 +434,27 @@ acceptLoop parameters handler = do
                    $ acceptLoop' state listenSockets
     else acceptLoop' state listenSockets
   where acceptLoop' state listenSockets = do
-          let fork = serverParametersForkPrimitive parameters
+          let acceptLoop'' :: Network.Socket -> HTTP ()
               acceptLoop'' listenSocket = do
-                (socket, peer) <- liftIO $ Network.accept listenSocket
-                state <- ask
-                liftIO $ fork $ flip runReaderT state
-                         $ requestLoop socket peer handler
+                (socket, peer) <- liftBase $ Network.accept listenSocket
+                httpFork $ requestLoop socket peer handler
                 acceptLoop'' listenSocket
           flip runReaderT state $ do
             httpLog $ "Server started."
-            mapM_ acceptLoop'' listenSockets
+            threadIDs <-
+              mapM (\listenSocket -> httpFork $ acceptLoop'' listenSocket)
+                   listenSockets
+            threadWaitLoop
+        threadWaitLoop = do
+          state <- getHTTPState
+          let mvar = httpStateThreadSetMVar state
+              qsem = httpStateThreadTerminationQSem state
+          threadSet <- readMVar mvar
+          if Set.null threadSet
+            then liftBase exitSuccess
+            else do
+              waitQSem qsem
+              threadWaitLoop
 
 
 createListenSocket :: HTTPListenSocketParameters -> IO Network.Socket
@@ -466,23 +474,23 @@ requestLoop :: Network.Socket
             -> HTTP ()
             -> HTTP ()
 requestLoop socket peer handler = do
-  inputBufferMVar <- liftIO $ newMVar $ BS.empty
-  timestampMVar <- liftIO $ newEmptyMVar
-  queryStringMVar <- liftIO $ newEmptyMVar
-  remoteHostnameMVar <- liftIO $ newMVar Nothing
-  requestMethodMVar <- liftIO $ newEmptyMVar
-  requestURIMVar <- liftIO $ newEmptyMVar
-  requestProtocolMVar <- liftIO $ newEmptyMVar
-  requestHeaderMapMVar <- liftIO $ newEmptyMVar
-  requestContentBufferMVar <- liftIO $ newEmptyMVar
-  requestContentParametersMVar <- liftIO $ newEmptyMVar
-  responseHeadersSentMVar <- liftIO $ newEmptyMVar
-  responseHeadersModifiableMVar <- liftIO $ newEmptyMVar
-  responseStatusMVar <- liftIO $ newEmptyMVar
-  responseHeaderMapMVar <- liftIO $ newEmptyMVar
-  responseCookieMapMVar <- liftIO $ newEmptyMVar
-  responseContentBufferMVar <- liftIO $ newEmptyMVar
-  responseContentParametersMVar <- liftIO $ newEmptyMVar
+  inputBufferMVar <- newMVar $ BS.empty
+  timestampMVar <- newEmptyMVar
+  queryStringMVar <- newEmptyMVar
+  remoteHostnameMVar <- newMVar Nothing
+  requestMethodMVar <- newEmptyMVar
+  requestURIMVar <- newEmptyMVar
+  requestProtocolMVar <- newEmptyMVar
+  requestHeaderMapMVar <- newEmptyMVar
+  requestContentBufferMVar <- newEmptyMVar
+  requestContentParametersMVar <- newEmptyMVar
+  responseHeadersSentMVar <- newEmptyMVar
+  responseHeadersModifiableMVar <- newEmptyMVar
+  responseStatusMVar <- newEmptyMVar
+  responseHeaderMapMVar <- newEmptyMVar
+  responseCookieMapMVar <- newEmptyMVar
+  responseContentBufferMVar <- newEmptyMVar
+  responseContentParametersMVar <- newEmptyMVar
   let connection = HTTPConnection {
                      httpConnectionSocket = socket,
                      httpConnectionPeer = peer,
@@ -510,53 +518,53 @@ requestLoop socket peer handler = do
                      httpConnectionResponseContentParameters
                        = responseContentParametersMVar
                    }
+      requestLoop' :: HTTP ()
       requestLoop' = do
-        httpCatch requestLoop''
-                  (\error -> do
-                     httpLog $ "Internal uncaught exception: "
-                               ++ (show (error :: Exception.SomeException))
-                     liftIO $ Network.sClose socket)
+        catch requestLoop''
+              (\error -> do
+                 httpLog $ "Internal uncaught exception: "
+                           ++ (show (error :: SomeException))
+                 liftBase $ Network.sClose socket)
+      requestLoop'' :: HTTP ()
       requestLoop'' = do
-        httpCatch requestLoop'''
-                  (\error -> do
-                     HTTPConnection {
-                         httpConnectionPeer = Network.SockAddrInet _ address
-                       } <- getHTTPConnection
-                     peerString <- liftIO $ Network.inet_ntoa address
-                     httpLog $ "Connection from " ++ peerString
-                               ++ " terminated due to error: "
-                               ++ (show (error :: ConnectionTerminatingError))
-                     liftIO $ Network.sClose socket)
+        catch requestLoop'''
+              (\error -> do
+                 HTTPConnection {
+                     httpConnectionPeer = Network.SockAddrInet _ address
+                   } <- getHTTPConnection
+                 peerString <- liftBase $ Network.inet_ntoa address
+                 httpLog $ "Connection from " ++ peerString
+                           ++ " terminated due to error: "
+                           ++ (show (error :: ConnectionTerminatingError))
+                 liftBase $ Network.sClose socket)
+      requestLoop''' :: HTTP ()
       requestLoop''' = do
         maybeRequestInfo <- recvHeaders
         case maybeRequestInfo of
           Nothing -> do
-            liftIO $ Exception.catch (Network.sClose socket)
-                                     (\error -> do
-                                        return $ error
-                                          :: IO Exception.IOException
-                                        return ())
+            catch (liftBase $ Network.sClose socket)
+                  (\error -> do
+                     return $ error :: HTTP IOException
+                     return ())
             return ()
           Just (method, url, protocol, headers) -> do
-            timestamp <- liftIO $ getPOSIXTime
-            liftIO $ putMVar timestampMVar timestamp
-            liftIO $ putMVar queryStringMVar Nothing -- TODO
-            liftIO $ putMVar requestMethodMVar $ UTF8.toString method
-            liftIO $ putMVar requestURIMVar $ UTF8.toString url
-            liftIO $ putMVar requestProtocolMVar $ UTF8.toString protocol
-            liftIO $ putMVar requestHeaderMapMVar headers
-            liftIO $ putMVar requestContentBufferMVar BS.empty
-            liftIO $ putMVar requestContentParametersMVar
-                             RequestContentUninitialized
-            liftIO $ putMVar responseHeadersSentMVar False
-            liftIO $ putMVar responseHeadersModifiableMVar True
-            liftIO $ putMVar responseStatusMVar 200
-            liftIO $ putMVar responseHeaderMapMVar Map.empty
-            liftIO $ putMVar responseCookieMapMVar Map.empty
-            liftIO $ putMVar responseContentBufferMVar BS.empty
-            liftIO $ putMVar responseContentParametersMVar
-                             ResponseContentUninitialized
-            httpCatch
+            timestamp <- liftBase getPOSIXTime
+            putMVar timestampMVar timestamp
+            putMVar queryStringMVar Nothing -- TODO
+            putMVar requestMethodMVar $ UTF8.toString method
+            putMVar requestURIMVar $ UTF8.toString url
+            putMVar requestProtocolMVar $ UTF8.toString protocol
+            putMVar requestHeaderMapMVar headers
+            putMVar requestContentBufferMVar BS.empty
+            putMVar requestContentParametersMVar RequestContentUninitialized
+            putMVar responseHeadersSentMVar False
+            putMVar responseHeadersModifiableMVar True
+            putMVar responseStatusMVar 200
+            putMVar responseHeaderMapMVar Map.empty
+            putMVar responseCookieMapMVar Map.empty
+            putMVar responseContentBufferMVar BS.empty
+            putMVar responseContentParametersMVar ResponseContentUninitialized
+            catch
               (do
                 valid <- getRequestValid
                 if valid
@@ -567,7 +575,7 @@ requestLoop socket peer handler = do
                     setResponseStatus 400)
               (\error -> do
                  httpLog $ "Uncaught exception: "
-                           ++ (show (error :: Exception.SomeException))
+                           ++ (show (error :: SomeException))
                  alreadySent <- responseHeadersSent
                  if alreadySent
                    then return ()
@@ -577,26 +585,26 @@ requestLoop socket peer handler = do
             if isWritable
               then httpCloseOutput
               else return ()
-            liftIO $ takeMVar timestampMVar
-            liftIO $ takeMVar queryStringMVar
-            liftIO $ takeMVar requestMethodMVar
-            liftIO $ takeMVar requestURIMVar
-            liftIO $ takeMVar requestProtocolMVar
-            liftIO $ takeMVar requestHeaderMapMVar
-            liftIO $ takeMVar requestContentBufferMVar
-            liftIO $ takeMVar requestContentParametersMVar
-            liftIO $ takeMVar responseHeadersSentMVar
-            liftIO $ takeMVar responseHeadersModifiableMVar
-            liftIO $ takeMVar responseStatusMVar
-            liftIO $ takeMVar responseHeaderMapMVar
-            liftIO $ takeMVar responseCookieMapMVar
-            liftIO $ takeMVar responseContentBufferMVar
-            liftIO $ takeMVar responseContentParametersMVar
+            takeMVar timestampMVar
+            takeMVar queryStringMVar
+            takeMVar requestMethodMVar
+            takeMVar requestURIMVar
+            takeMVar requestProtocolMVar
+            takeMVar requestHeaderMapMVar
+            takeMVar requestContentBufferMVar
+            takeMVar requestContentParametersMVar
+            takeMVar responseHeadersSentMVar
+            takeMVar responseHeadersModifiableMVar
+            takeMVar responseStatusMVar
+            takeMVar responseHeaderMapMVar
+            takeMVar responseCookieMapMVar
+            takeMVar responseContentBufferMVar
+            takeMVar responseContentParametersMVar
             requestLoop'''
   state <- ask
-  liftIO $ flip runReaderT
-                (state { httpStateMaybeConnection = Just connection })
-                requestLoop'
+  lift $ flip runReaderT
+              (state { httpStateMaybeConnection = Just connection })
+              requestLoop'
 
 
 getRequestValid :: (MonadHTTP m) => m Bool
@@ -605,7 +613,7 @@ getRequestValid = do
   let getHeadersValid = do
         HTTPConnection { httpConnectionRequestHeaderMap = mvar }
           <- getHTTPConnection
-        headerMap <- liftIO $ readMVar mvar
+        headerMap <- readMVar mvar
         return $ all (\header -> (isValidInRequest header)
                                  && (hasContent
                                      || (not $ isValidOnlyWithEntity header)))
@@ -613,7 +621,7 @@ getRequestValid = do
       getContentValid = do
         contentAllowed <- getRequestContentAllowed
         return $ contentAllowed || not hasContent
-  httpVersion <- getRequestProtocol >>= return . fromJust
+  httpVersion <- getRequestProtocol
   case httpVersion of
     "HTTP/1.0" -> do
       headersValid <- getHeadersValid
@@ -633,7 +641,7 @@ getRequestValid = do
 prepareResponse :: (MonadHTTP m) => m ()
 prepareResponse = do
   HTTPConnection { httpConnectionTimestamp = mvar } <- getHTTPConnection
-  timestamp <- liftIO $ readMVar mvar
+  timestamp <- readMVar mvar
   let dateString = formatTime defaultTimeLocale
                               "%a, %d %b %Y %H:%M:%S Z"
                               $ posixSecondsToUTCTime timestamp
@@ -649,18 +657,18 @@ logAccess = do
                     HTTPConnection { httpConnectionPeer = peer } <- getHTTPConnection
                     case peer of
                       Network.SockAddrInet _ address
-                        -> liftIO $ Network.inet_ntoa address
+                        -> liftBase $ Network.inet_ntoa address
                   Just peerString -> return peerString
   identString <- return "-"
   usernameString <- return "-"
   HTTPConnection { httpConnectionTimestamp = timestampMVar } <- getHTTPConnection
-  timestamp <- liftIO $ readMVar timestampMVar
+  timestamp <- readMVar timestampMVar
   let timestampString = formatTime defaultTimeLocale
                                    "%-d/%b/%Y:%H:%M:%S %z"
                                    $ posixSecondsToUTCTime timestamp
-  methodString <- getRequestMethod >>= return . fromJust
-  urlString <- getRequestURI >>= return . fromJust
-  protocolString <- getRequestProtocol >>= return . fromJust
+  methodString <- getRequestMethod
+  urlString <- getRequestURI
+  protocolString <- getRequestProtocol
   responseStatusString <- getResponseStatus >>= return . show
   maybeResponseSize <- return (Nothing :: Maybe Int) -- TODO
   responseSizeString
@@ -830,7 +838,7 @@ recvHeaders :: (MonadHTTP m)
 recvHeaders = do
   HTTPConnection { httpConnectionInputBufferMVar = inputBufferMVar }
     <- getHTTPConnection
-  inputBuffer <- liftIO $ takeMVar inputBufferMVar
+  inputBuffer <- takeMVar inputBufferMVar
   (inputBuffer, maybeLine) <- recvLine inputBuffer
   result <- case maybeLine of
     Nothing -> return Nothing
@@ -878,7 +886,7 @@ recvHeaders = do
         _ -> do
           logInvalidRequest
           return Nothing
-  liftIO $ putMVar inputBufferMVar inputBuffer
+  putMVar inputBufferMVar inputBuffer
   return result
 
 
@@ -892,7 +900,7 @@ parseHeader line = do
 logInvalidRequest :: MonadHTTP m => m ()
 logInvalidRequest = do
   HTTPConnection { httpConnectionPeer = Network.SockAddrInet _ address } <- getHTTPConnection
-  peerString <- liftIO $ Network.inet_ntoa address
+  peerString <- liftBase $ Network.inet_ntoa address
   httpLog $ "Invalid request from " ++ peerString ++ "; closing its connection."
 
 
@@ -943,11 +951,11 @@ recvLine inputBuffer = do
 recvBlock :: (MonadHTTP m) => Int -> m ByteString
 recvBlock length = do
   HTTPConnection { httpConnectionInputBufferMVar = inputBufferMVar } <- getHTTPConnection
-  inputBuffer <- liftIO $ takeMVar inputBufferMVar
+  inputBuffer <- takeMVar inputBufferMVar
   (inputBuffer, endOfInput)
     <- extendInputBuffer inputBuffer length True
   (result, inputBuffer) <- return $ BS.splitAt length inputBuffer
-  liftIO $ putMVar inputBufferMVar inputBuffer
+  putMVar inputBufferMVar inputBuffer
   return result
 
 
@@ -958,7 +966,7 @@ extendInputBuffer inputBuffer length blocking = do
   let loop inputBuffer = do
         if BS.length inputBuffer < length
           then do
-            newInput <- liftIO $ Network.recv socket 4096
+            newInput <- liftBase $ Network.recv socket 4096
             if BS.null newInput
               then return (inputBuffer, True)
               else if blocking
@@ -972,30 +980,31 @@ extendInputBuffer inputBuffer length blocking = do
 httpLog :: (MonadHTTP m) => String -> m ()
 httpLog message = do
   HTTPState { httpStateErrorLogMaybeHandleMVar = logMVar } <- getHTTPState
-  httpBracket (liftIO $ takeMVar logMVar)
-              (\maybeHandle -> liftIO $ putMVar logMVar maybeHandle)
-              (\maybeHandle -> do
-                 case maybeHandle of
-                   Nothing -> return ()
-                   Just handle -> do
-                     timestamp <- liftIO $ getPOSIXTime
-                     let timestampString
-                           = formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
-                                        $ posixSecondsToUTCTime timestamp
-                     liftIO $ hPutStrLn handle $ timestampString ++ " " ++ message
-                     liftIO $ hFlush handle)
+  bracket (takeMVar logMVar)
+          (\maybeHandle -> putMVar logMVar maybeHandle)
+          (\maybeHandle -> do
+             case maybeHandle of
+               Nothing -> return ()
+               Just handle -> do
+                 timestamp <- liftBase $ getPOSIXTime
+                 let timestampString =
+                       formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ"
+                                  $ posixSecondsToUTCTime timestamp
+                 liftBase $ hPutStrLn handle
+                   $ timestampString ++ " " ++ message
+                 liftBase $ hFlush handle)
 
 
 -- | Logs a message using the web server's logging facility.
 httpAccessLog :: (MonadHTTP m) => String -> m ()
 httpAccessLog message = do
   HTTPState { httpStateAccessLogMaybeHandleMVar = logMVar } <- getHTTPState
-  liftIO $ withMVar logMVar
-                    (\maybeHandle -> case maybeHandle of
-                                       Nothing -> return ()
-                                       Just handle -> do
-                                         hPutStrLn handle message
-                                         hFlush handle)
+  withMVar logMVar
+           (\maybeHandle -> case maybeHandle of
+                              Nothing -> return ()
+                              Just handle -> do
+                                liftBase $ hPutStrLn handle message
+                                liftBase $ hFlush handle)
 
 
 -- | Headers are classified by HTTP/1.1 as request headers, response headers,
@@ -1334,7 +1343,7 @@ getRequestVariable "REMOTE_ADDR" = do
   case maybeResult of
     Nothing -> return Nothing
     Just result -> do
-      result <- liftIO $ Network.inet_ntoa result
+      result <- liftBase $ Network.inet_ntoa result
       return $ Just result
 getRequestVariable "REMOTE_PORT" = do
   maybeResult <- getRemotePort
@@ -1344,16 +1353,14 @@ getRequestVariable "REMOTE_PORT" = do
 getRequestVariable "REMOTE_HOST" = getRemoteHost
 getRequestVariable "REMOTE_IDENT" = getRemoteIdent
 getRequestVariable "REMOTE_USER" = getRemoteUser
-getRequestVariable "REQUEST_METHOD" = getRequestMethod
-getRequestVariable "REQUEST_URI" = getRequestURI
-getRequestVariable "SCRIPT_FILENAME" = getScriptFilename
-getRequestVariable "SCRIPT_NAME" = getScriptName
+getRequestVariable "REQUEST_METHOD" = getRequestMethod >>= return . Just
+getRequestVariable "REQUEST_URI" = getRequestURI >>= return . Just
 getRequestVariable "SERVER_ADDR" = do
   maybeResult <- getServerAddress
   case maybeResult of
     Nothing -> return Nothing
     Just result -> do
-      result <- liftIO $ Network.inet_ntoa result
+      result <- liftBase $ Network.inet_ntoa result
       return $ Just result
 getRequestVariable "SERVER_NAME" = getServerName
 getRequestVariable "SERVER_PORT" = do
@@ -1424,7 +1431,7 @@ getRequestHeader
     -> m (Maybe String) -- ^ The value of the header, if the user agent provided one.
 getRequestHeader header = do
   HTTPConnection { httpConnectionRequestHeaderMap = mvar } <- getHTTPConnection
-  headerMap <- liftIO $ readMVar mvar
+  headerMap <- readMVar mvar
   return $ fmap (stripHeaderValueWhitespace . UTF8.toString)
                 $ Map.lookup header headerMap
 
@@ -1455,7 +1462,7 @@ isHeaderValueWhitespace char = elem char " \t\r\n"
 getAllRequestHeaders :: (MonadHTTP m) => m [(Header, String)]
 getAllRequestHeaders = do
   HTTPConnection { httpConnectionRequestHeaderMap = mvar } <- getHTTPConnection
-  headerMap <- liftIO $ readMVar mvar
+  headerMap <- readMVar mvar
   return $ map (\(header, bytestring) -> (header, UTF8.toString bytestring))
                $ Map.toList headerMap
 
@@ -1522,7 +1529,7 @@ getPathTranslated = do
 getQueryString :: (MonadHTTP m) => m (Maybe String)
 getQueryString = do
   HTTPConnection { httpConnectionQueryString = mvar } <- getHTTPConnection
-  liftIO $ readMVar mvar
+  readMVar mvar
 
 
 -- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
@@ -1562,28 +1569,28 @@ getRemotePort = do
 getRemoteHost :: (MonadHTTP m) => m (Maybe String)
 getRemoteHost = do
   HTTPConnection { httpConnectionRemoteHostname = mvar } <- getHTTPConnection
-  maybeMaybeHostname <- liftIO $ readMVar mvar
+  maybeMaybeHostname <- readMVar mvar
   case maybeMaybeHostname of
     Nothing -> do
       HTTPConnection { httpConnectionPeer = peer } <- getHTTPConnection
       inputHostname <- case peer of
         Network.SockAddrInet _ address -> do
-          string <- liftIO $ Network.inet_ntoa address
+          string <- liftBase $ Network.inet_ntoa address
           return string
-      maybeValues <- liftIO $ Network.getAddrInfo
-                               (Just $ Network.defaultHints {
-                                         Network.addrFlags
-                                           = [Network.AI_CANONNAME]
-                                       })
-                               (Just inputHostname)
-                               Nothing
+      maybeValues <- liftBase $ Network.getAddrInfo
+                                  (Just $ Network.defaultHints {
+                                              Network.addrFlags =
+                                                [Network.AI_CANONNAME]
+                                            })
+                                  (Just inputHostname)
+                                  Nothing
       let maybeHostname = case maybeValues of
                             (Network.AddrInfo {
                                         Network.addrCanonName = Just result
                                       }:_)
                               -> Just result
                             _ -> Nothing
-      liftIO $ swapMVar mvar $ Just maybeHostname
+      swapMVar mvar $ Just maybeHostname
       return maybeHostname
     Just maybeHostname -> return maybeHostname
 
@@ -1605,37 +1612,23 @@ getRemoteUser = do
 
 
 -- | Return the request method.
-getRequestMethod :: (MonadHTTP m) => m (Maybe String)
+getRequestMethod :: (MonadHTTP m) => m String
 getRequestMethod = do
-  HTTPConnection { httpConnectionRequestMethod = mvar } <- getHTTPConnection
-  liftIO $ readMVar mvar >>= return . Just
+  connection <- getHTTPConnection
+  readMVar (httpConnectionRequestMethod connection)
 
 
 -- | Return the request URI.
-getRequestURI :: (MonadHTTP m) => m (Maybe String)
+getRequestURI :: (MonadHTTP m) => m String
 getRequestURI = do
-  HTTPConnection { httpConnectionRequestURI = mvar } <- getHTTPConnection
-  liftIO $ readMVar mvar >>= return . Just
+  connection <- getHTTPConnection
+  readMVar (httpConnectionRequestURI connection)
 
 
-getRequestProtocol :: (MonadHTTP m) => m (Maybe String)
+getRequestProtocol :: (MonadHTTP m) => m String
 getRequestProtocol = do
-  HTTPConnection { httpConnectionRequestProtocol = protocolMVar } <- getHTTPConnection
-  liftIO $ readMVar protocolMVar >>= return . Just
-
-
--- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
---   the corresponding function would return the script filename.
-getScriptFilename :: (MonadHTTP m) => m (Maybe String)
-getScriptFilename = do
-  return Nothing
-
-
--- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
---   the corresponding function would return the script name.
-getScriptName :: (MonadHTTP m) => m (Maybe String)
-getScriptName = do
-  return Nothing
+  connection <- getHTTPConnection
+  readMVar (httpConnectionRequestProtocol connection)
 
 
 -- | Return the server address.
@@ -1700,9 +1693,9 @@ getRequestHasContent :: (MonadHTTP m) => m Bool
 getRequestHasContent = do
   HTTPConnection { httpConnectionRequestContentParameters = parametersMVar }
     <- getHTTPConnection
-  parameters <- liftIO $ takeMVar parametersMVar
+  parameters <- takeMVar parametersMVar
   parameters <- ensureRequestContentParametersInitialized parameters
-  liftIO $ putMVar parametersMVar parameters
+  putMVar parametersMVar parameters
   return $ case parameters of
     RequestContentNone -> False
     _ -> True
@@ -1710,7 +1703,7 @@ getRequestHasContent = do
 
 getRequestContentAllowed :: (MonadHTTP m) => m Bool
 getRequestContentAllowed = do
-  Just method <- getRequestMethod
+  method <- getRequestMethod
   case method of
     _ | method == "OPTIONS" -> return True
       | method == "GET" -> return False
@@ -1756,9 +1749,9 @@ httpIsReadable :: (MonadHTTP m) => m Bool
 httpIsReadable = do
   HTTPConnection { httpConnectionRequestContentParameters = parametersMVar }
     <- getHTTPConnection
-  parameters <- liftIO $ takeMVar parametersMVar
+  parameters <- takeMVar parametersMVar
   parameters <- ensureRequestContentParametersInitialized parameters
-  liftIO $ putMVar parametersMVar parameters
+  putMVar parametersMVar parameters
   return $ case parameters of
              RequestContentNone -> False
              RequestContentClosed -> False
@@ -1774,16 +1767,16 @@ httpGet' maybeSize blocking discarding = do
       httpConnectionRequestContentBuffer = bufferMVar,
       httpConnectionRequestContentParameters = parametersMVar
     } <- getHTTPConnection
-  buffer <- liftIO $ takeMVar bufferMVar
-  parameters <- liftIO $ takeMVar parametersMVar
+  buffer <- takeMVar bufferMVar
+  parameters <- takeMVar parametersMVar
   parameters <- ensureRequestContentParametersInitialized parameters
   (buffer, parameters)
     <- extendRequestContentBuffer buffer parameters maybeSize blocking
   (result, buffer) <- return $ case maybeSize of
                         Nothing -> (buffer, BS.empty)
                         Just size -> BS.splitAt size buffer
-  liftIO $ putMVar parametersMVar parameters
-  liftIO $ putMVar bufferMVar buffer
+  putMVar parametersMVar parameters
+  putMVar bufferMVar buffer
   return result
 
 
@@ -1838,7 +1831,7 @@ extendRequestContentBuffer highLevelBuffer
                 (lowLevelBuffer, endOfInput)
                   <- extendInputBuffer lowLevelBuffer lengthRemaining blocking
                 if endOfInput
-                  then httpThrow UnexpectedEndOfInput
+                  then throwIO UnexpectedEndOfInput
                   else return ()
                 let (toHighLevelBuffer, lowLevelBuffer')
                       = BS.splitAt lengthRemaining lowLevelBuffer
@@ -1856,14 +1849,14 @@ extendRequestContentBuffer highLevelBuffer
                   else loop highLevelBuffer' lowLevelBuffer' parameters'
               RequestContentChunked _ _ -> do
                  httpLog $ "Don't understand chunked."
-                 httpThrow UnexpectedEndOfInput
+                 throwIO UnexpectedEndOfInput
                  -- TODO
   HTTPConnection { httpConnectionInputBufferMVar = lowLevelBufferMVar }
     <- getHTTPConnection
-  lowLevelBuffer <- liftIO $ takeMVar lowLevelBufferMVar
+  lowLevelBuffer <- takeMVar lowLevelBufferMVar
   (highLevelBuffer, lowLevelBuffer, parameters)
     <- loop highLevelBuffer lowLevelBuffer parameters
-  liftIO $ putMVar lowLevelBufferMVar lowLevelBuffer
+  putMVar lowLevelBufferMVar lowLevelBuffer
   return (highLevelBuffer, parameters)
 
 
@@ -1879,7 +1872,7 @@ setResponseStatus status = do
   requireResponseHeadersNotYetSent
   requireResponseHeadersModifiable
   HTTPConnection { httpConnectionResponseStatus = mvar } <- getHTTPConnection
-  liftIO $ swapMVar mvar status
+  swapMVar mvar status
   return ()
       
 
@@ -1891,7 +1884,7 @@ getResponseStatus
     => m Int -- ^ The HTTP/1.1 status code.
 getResponseStatus = do
   HTTPConnection { httpConnectionResponseStatus = mvar } <- getHTTPConnection
-  liftIO $ readMVar mvar
+  readMVar mvar
 
 
 -- | Sets the given 'HttpHeader' response header to the given string value,
@@ -1916,10 +1909,10 @@ setResponseHeader header value = do
   if isValidInResponse header
     then do
       HTTPConnection { httpConnectionResponseHeaderMap = mvar } <- getHTTPConnection
-      headerMap <- liftIO $ takeMVar mvar
+      headerMap <- takeMVar mvar
       headerMap <- return $ Map.insert header (UTF8.fromString value) headerMap
-      liftIO $ putMVar mvar headerMap
-    else httpThrow $ NotAResponseHeader header
+      putMVar mvar headerMap
+    else throwIO $ NotAResponseHeader header
 
 
 -- | Causes the given 'HttpHeader' response header not to be sent, overriding
@@ -1943,10 +1936,10 @@ unsetResponseHeader header = do
   if isValidInResponse header
     then do
       HTTPConnection { httpConnectionResponseHeaderMap = mvar } <- getHTTPConnection
-      headerMap <- liftIO $ takeMVar mvar
+      headerMap <- takeMVar mvar
       headerMap <- return $ Map.delete header headerMap
-      liftIO $ putMVar mvar headerMap
-    else httpThrow $ NotAResponseHeader header
+      putMVar mvar headerMap
+    else throwIO $ NotAResponseHeader header
 
 
 -- | Returns the value of the given header which will be or has been sent with
@@ -1962,9 +1955,9 @@ getResponseHeader header = do
   if isValidInResponse header
     then do
       HTTPConnection { httpConnectionResponseHeaderMap = mvar } <- getHTTPConnection
-      headerMap <- liftIO $ readMVar mvar
+      headerMap <- readMVar mvar
       return $ fmap UTF8.toString $ Map.lookup header headerMap
-    else httpThrow $ NotAResponseHeader header
+    else throwIO $ NotAResponseHeader header
 
 
 -- | Causes the user agent to record the given cookie and send it back with
@@ -1987,9 +1980,9 @@ setCookie cookie = do
   requireValidCookieName $ cookieName cookie
   {-
   HTTPConnection { request = Just request } <- getHTTPConnection
-  responseCookieMap <- liftIO $ takeMVar $ responseCookieMapMVar request
+  responseCookieMap <- takeMVar $ responseCookieMapMVar request
   let responseCookieMap' = Map.insert (cookieName cookie) cookie responseCookieMap
-  liftIO $ putMVar (responseCookieMapMVar request) responseCookieMap'
+  putMVar (responseCookieMapMVar request) responseCookieMap'
   -}
   return ()
   -- TODO
@@ -2014,9 +2007,9 @@ unsetCookie name = do
   requireValidCookieName name
   {-
   HTTPConnection { request = Just request } <- getHTTPConnection
-  responseCookieMap <- liftIO $ takeMVar $ responseCookieMapMVar request
+  responseCookieMap <- takeMVar $ responseCookieMapMVar request
   let responseCookieMap' = Map.insert name (mkUnsetCookie name) responseCookieMap
-  liftIO $ putMVar (responseCookieMapMVar request) responseCookieMap'
+  putMVar (responseCookieMapMVar request) responseCookieMap'
   -}
   return ()
   -- TODO
@@ -2082,7 +2075,7 @@ mkUnsetCookie name  = Cookie {
 requireValidCookieName :: (MonadHTTP m) => String -> m ()
 requireValidCookieName name = do
   if not $ isValidCookieToken name
-    then httpThrow $ CookieNameInvalid name
+    then throwIO $ CookieNameInvalid name
     else return ()
 
 
@@ -2114,10 +2107,13 @@ data HTTPException
     | CookieNameInvalid String
       -- ^ An exception thrown by operations which are given cookie names that do not
       --   meet the appropriate syntax requirements.
+    | NoConnection
+      -- ^ An exception thrown by operations which expect a connection to
+      --   exist (as it always does within a handler), when none does.
       deriving (Show, Typeable)
 
 
-instance Exception.Exception HTTPException
+instance Exception HTTPException
 
 
 -- | Sets the HTTP/1.1 return status to 301 and sets the 'HttpLocation' header
@@ -2166,13 +2162,13 @@ sendResponseHeaders = do
       httpConnectionResponseHeaderMap = responseHeaderMapMVar,
       httpConnectionResponseCookieMap = responseCookieMapMVar
     } <- getHTTPConnection
-  alreadySent <- liftIO $ takeMVar alreadySentMVar
+  alreadySent <- takeMVar alreadySentMVar
   if not alreadySent
     then do
-      liftIO $ swapMVar modifiableMVar False
-      responseStatus <- liftIO $ readMVar responseStatusMVar
-      responseHeaderMap <- liftIO $ readMVar responseHeaderMapMVar
-      responseCookieMap <- liftIO $ readMVar responseCookieMapMVar
+      swapMVar modifiableMVar False
+      responseStatus <- readMVar responseStatusMVar
+      responseHeaderMap <- readMVar responseHeaderMapMVar
+      responseCookieMap <- readMVar responseCookieMapMVar
       let statusLine = BS.concat [UTF8.fromString "HTTP/1.1 ",
                                   UTF8.fromString $ show responseStatus,
                                   UTF8.fromString " ",
@@ -2194,16 +2190,16 @@ sendResponseHeaders = do
                                                 value, UTF8.fromString "\r\n"])
                                          nameValuePairs)
                                ++ [delimiterLine]
-      liftIO $ Network.sendAll socket buffer
+      liftBase $ Network.sendAll socket buffer
     else return ()
-  liftIO $ putMVar alreadySentMVar True
+  putMVar alreadySentMVar True
 
 
 markResponseHeadersUnmodifiable :: (MonadHTTP m) => m ()
 markResponseHeadersUnmodifiable = do
   HTTPConnection { httpConnectionResponseHeadersModifiable = modifiableMVar }
     <- getHTTPConnection
-  liftIO $ swapMVar modifiableMVar False
+  swapMVar modifiableMVar False
   return ()
 
 
@@ -2260,7 +2256,7 @@ responseHeadersSent :: (MonadHTTP m) => m Bool
 responseHeadersSent = do
   HTTPConnection { httpConnectionResponseHeadersSent = mvar }
     <- getHTTPConnection
-  liftIO $ readMVar mvar
+  readMVar mvar
 
 
 -- | Returns whether the response headers are modifiable, a prerequisite of
@@ -2270,7 +2266,7 @@ responseHeadersModifiable :: (MonadHTTP m) => m Bool
 responseHeadersModifiable = do
   HTTPConnection { httpConnectionResponseHeadersModifiable = mvar }
     <- getHTTPConnection
-  liftIO $ readMVar mvar
+  readMVar mvar
 
 
 -- | Appends data, interpreted as binary, to the content of the HTTP response.
@@ -2326,11 +2322,11 @@ httpPut bytestring = do
       httpConnectionResponseContentBuffer = bufferMVar,
       httpConnectionResponseContentParameters = parametersMVar
     } <- getHTTPConnection
-  buffer <- liftIO $ takeMVar bufferMVar
-  parameters <- liftIO $ takeMVar parametersMVar
+  buffer <- takeMVar bufferMVar
+  parameters <- takeMVar parametersMVar
   parameters <- ensureResponseContentParametersInitialized parameters
   (buffer, parameters) <- case parameters of
-    ResponseContentClosed -> httpThrow OutputAlreadyClosed
+    ResponseContentClosed -> throwIO OutputAlreadyClosed
     ResponseContentBufferedIdentity -> do
       return (BS.append buffer bytestring, ResponseContentBufferedIdentity)
     ResponseContentUnbufferedIdentity lengthRemaining -> do
@@ -2338,9 +2334,9 @@ httpPut bytestring = do
       let lengthThisPut = BS.length bytestring
       if lengthThisPut > lengthRemaining
         then do
-          liftIO $ putMVar parametersMVar ResponseContentClosed
-          liftIO $ putMVar bufferMVar BS.empty
-          httpThrow OutputAlreadyClosed
+          putMVar parametersMVar ResponseContentClosed
+          putMVar bufferMVar BS.empty
+          throwIO OutputAlreadyClosed
         else do
           let parameters' = ResponseContentUnbufferedIdentity
                              $ lengthRemaining - lengthThisPut
@@ -2348,12 +2344,12 @@ httpPut bytestring = do
           return (buffer, parameters')
     ResponseContentChunked -> do
       httpLog $ "Chunked not implemented."
-      liftIO $ putMVar parametersMVar parameters
-      liftIO $ putMVar bufferMVar buffer
-      httpThrow UnexpectedEndOfInput
+      putMVar parametersMVar parameters
+      putMVar bufferMVar buffer
+      throwIO UnexpectedEndOfInput
       -- TODO
-  liftIO $ putMVar parametersMVar parameters
-  liftIO $ putMVar bufferMVar buffer
+  putMVar parametersMVar parameters
+  putMVar bufferMVar buffer
 
 
 ensureResponseContentParametersInitialized
@@ -2389,38 +2385,38 @@ flushResponseContent = do
       httpConnectionResponseContentBuffer = bufferMVar,
       httpConnectionResponseContentParameters = parametersMVar
     } <- getHTTPConnection
-  buffer <- liftIO $ takeMVar bufferMVar
-  parameters <- liftIO $ takeMVar parametersMVar
+  buffer <- takeMVar bufferMVar
+  parameters <- takeMVar parametersMVar
   parameters <- ensureResponseContentParametersInitialized parameters
   case parameters of
-    ResponseContentClosed -> httpThrow OutputAlreadyClosed
+    ResponseContentClosed -> throwIO OutputAlreadyClosed
     ResponseContentBufferedIdentity -> do
       send buffer
       return ()
     ResponseContentUnbufferedIdentity lengthRemaining -> do
       if lengthRemaining > 0
         then do
-          liftIO $ putMVar parametersMVar ResponseContentClosed
-          liftIO $ putMVar bufferMVar BS.empty
-          httpThrow OutputIncomplete
+          putMVar parametersMVar ResponseContentClosed
+          putMVar bufferMVar BS.empty
+          throwIO OutputIncomplete
         else return ()
     ResponseContentChunked -> do
       httpLog $ "Chunked not implemented."
-      liftIO $ putMVar parametersMVar parameters
-      liftIO $ putMVar bufferMVar buffer
-      httpThrow UnexpectedEndOfInput
+      putMVar parametersMVar parameters
+      putMVar bufferMVar buffer
+      throwIO UnexpectedEndOfInput
       -- TODO
-  liftIO $ putMVar parametersMVar ResponseContentClosed
-  liftIO $ putMVar bufferMVar BS.empty
+  putMVar parametersMVar ResponseContentClosed
+  putMVar bufferMVar BS.empty
 
 
 send :: (MonadHTTP m) => ByteString -> m ()
 send bytestring = do
   HTTPConnection { httpConnectionSocket = socket } <- getHTTPConnection
-  httpCatch (liftIO $ Network.sendAll socket bytestring)
-            (\e -> do
-               return (e :: Exception.SomeException)
-               return ())
+  catch (liftBase $ Network.sendAll socket bytestring)
+        (\e -> do
+           return (e :: SomeException)
+           return ())
 
 
 -- | Appends text, encoded as UTF8, to the content of the HTTP response.  In
@@ -2455,9 +2451,9 @@ httpIsWritable :: (MonadHTTP m) => m Bool
 httpIsWritable = do
   HTTPConnection { httpConnectionResponseContentParameters = parametersMVar }
     <- getHTTPConnection
-  parameters <- liftIO $ takeMVar parametersMVar
+  parameters <- takeMVar parametersMVar
   parameters <- ensureResponseContentParametersInitialized parameters
-  liftIO $ putMVar parametersMVar parameters
+  putMVar parametersMVar parameters
   return $ case parameters of
              ResponseContentClosed -> False
              _ -> True
@@ -2467,7 +2463,7 @@ requireResponseHeadersNotYetSent :: (MonadHTTP m) => m ()
 requireResponseHeadersNotYetSent = do
   alreadySent <- responseHeadersSent
   if alreadySent
-    then httpThrow ResponseHeadersAlreadySent
+    then throwIO ResponseHeadersAlreadySent
     else return ()
 
 
@@ -2476,123 +2472,13 @@ requireResponseHeadersModifiable = do
   modifiable <- responseHeadersModifiable
   if modifiable
     then return ()
-    else httpThrow ResponseHeadersNotModifiable
+    else throwIO ResponseHeadersNotModifiable
 
 
 requireOutputNotYetClosed :: (MonadHTTP m) => m ()
 requireOutputNotYetClosed = do
   isWritable <- httpIsWritable
   case isWritable of
-    False -> httpThrow OutputAlreadyClosed
+    False -> throwIO OutputAlreadyClosed
     True -> return ()
 
-
--- | Throw an exception in any 'MonadHTTP' monad.
-httpThrow
-    :: (Exception.Exception e, MonadHTTP m)
-    => e -- ^ The exception to throw.
-    -> m a
-httpThrow exception = implementationThrowHTTP exception
-
-
--- | Perform an action, with a given exception-handler action bound.  See
---   'Control.Exception.catch'.  The type of exception to catch is determined by the
---   type signature of the handler.
-httpCatch
-    :: (Exception.Exception e, MonadHTTP m)
-    => m a -- ^ The action to run with the exception handler binding in scope.
-    -> (e -> m a) -- ^ The exception handler to bind.
-    -> m a
-httpCatch action handler = implementationCatchHTTP action handler
-
-
--- | Block exceptions within an action, as per the discussion in 'Control.Exception'.
-httpBlock
-    :: (MonadHTTP m)
-    => m a -- ^ The action to run with exceptions blocked.
-    -> m a
-httpBlock action = implementationBlockHTTP action
-
-
--- | Unblock exceptions within an action, as per the discussion in 'Control.Exception'.
-httpUnblock
-    :: (MonadHTTP m)
-    => m a -- ^ The action to run with exceptions unblocked.
-    -> m a
-httpUnblock action = implementationUnblockHTTP action
-
-
--- | Acquire a resource, perform computation with it, and release it; see the description
---   of 'Control.Exception.bracket'.  If an exception is raised during the computation,
---   'httpBracket' will re-raise it after running the release function, having the effect
---   of propagating the exception further up the call stack.
-httpBracket
-    :: (MonadHTTP m)
-    => m a -- ^ The action to acquire the resource.
-    -> (a -> m b) -- ^ The action to release the resource.
-    -> (a -> m c) -- ^ The action to perform using the resource.
-    -> m c -- ^ The return value of the perform-action.
-httpBracket acquire release perform = do
-  httpBlock (do
-           resource <- acquire
-           result <- httpUnblock (perform resource) `httpOnException` (release resource)
-           release resource
-           return result)
-
-
--- | Perform an action, with a cleanup action bound to always occur; see the
---   description of 'Control.Exception.finally'.  If an exception is raised during the
---   computation, 'httpFinally' will re-raise it after running the cleanup action, having
---   the effect of propagating the exception further up the call stack.  If no
---   exception is raised, the cleanup action will be invoked after the main action is
---   performed.
-httpFinally
-    :: (MonadHTTP m)
-    => m a -- ^ The action to perform.
-    -> m b -- ^ The cleanup action.
-    -> m a -- ^ The return value of the perform-action.
-httpFinally perform cleanup = do
-  httpBlock (do
-           result <- httpUnblock perform `httpOnException` cleanup
-           cleanup
-           return result)
-
-
--- | Perform an action.  If any exceptions of the appropriate type occur within the
---   action, return 'Left' @exception@; otherwise, return 'Right' @result@.
-httpTry
-    :: (Exception.Exception e, MonadHTTP m)
-    => m a -- ^ The action to perform.
-    -> m (Either e a)
-httpTry action = do
-  httpCatch (do
-           result <- action
-           return $ Right result)
-         (\exception -> return $ Left exception)
-
-
--- | As 'httpCatch', but with the arguments in the other order.
-httpHandle
-    :: (Exception.Exception e, MonadHTTP m)
-    => (e -> m a) -- ^ The exception handler to bind.
-    -> m a -- ^ The action to run with the exception handler binding in scope.
-    -> m a
-httpHandle handler action = httpCatch action handler
-
-
--- | Perform an action, with a cleanup action bound to occur if and only if an exception
---   is raised during the action; see the description of 'Control.Exception.finally'.
---   If an exception is raised during the computation, 'httpFinally' will re-raise it
---   after running the cleanup action, having the effect of propagating the exception
---   further up the call stack.  If no exception is raised, the cleanup action will not
---   be invoked.
-httpOnException
-    :: (MonadHTTP m)
-    => m a -- ^ The action to perform.
-    -> m b -- ^ The cleanup action.
-    -> m a -- ^ The return value of the perform-action.
-httpOnException action cleanup = do
-  httpCatch action
-         (\exception -> do
-            cleanup
-            httpThrow (exception :: Exception.SomeException))

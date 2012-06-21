@@ -54,4 +54,4 @@
 (^|/)\.waf-[[:digit:].]+-[[:digit:]]+($|/)
 (^|/)\.lock-wscript$
 ^\.darcs-temp-mail$
-^dist($|/)
+(^|/)dist($|/)

@@ -15,12 +15,19 @@ main = do
                  serverParametersDaemonize = True,
                  serverParametersUserToChangeTo = Just "irene",
                  serverParametersGroupToChangeTo = Just "irene",
-                 serverParametersNames
-                   = [(["ireneknapp.com", "localhost"],
-                       [(loopbackAddress, 8000, False),
-                        (loopbackAddress, 4430, True)])]
+                 serverParametersForkPrimitive = forkIO,
+                 serverParametersListenSockets =
+                   [HTTPListenSocketParameters {
+                        listenSocketParametersHostAddress = loopbackAddress,
+                        listenSocketParametersPortNumber = 8000,
+                        listenSocketParametersSecure = False
+                      } {- ,
+                    HTTPListenSocketParameters {
+                        listenSocketParametersHostAddress = loopbackAddress,
+                        listenSocketParametersPortNumber = 4430,
+                        listenSocketParametersSecure = True
+                      } -} ]
                }
-             forkIO
              $ do
                  inputData <- httpGet 4096
                  httpPutStr $ "Received " ++ (show $ BS.length inputData) ++ " bytes."
