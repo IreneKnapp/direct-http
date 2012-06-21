@@ -1,4 +1,4 @@
-{-# LANGUAGE TypeSynonymInstances, DeriveDataTypeable #-}
+{-# LANGUAGE TypeSynonymInstances, FlexibleInstances, DeriveDataTypeable #-}
 module Network.HTTP (
              -- * The monad
              HTTP,
@@ -12,23 +12,27 @@ module Network.HTTP (
              
              -- * Accepting requests
              HTTPServerParameters(..),
+             HTTPListenSocketParameters(..),
              acceptLoop,
              
              -- * Logging
              httpLog,
              
              -- * Request information
-             -- | It is common practice for web servers to make their own extensions to
-             --   the CGI/1.1 set of defined variables.  For example, @REMOTE_PORT@ is
-             --   not defined by the specification, but often seen in the wild.
-             --   Furthermore, it is also common for user agents to make their own
-             --   extensions to the HTTP/1.1 set of defined headers.  Therefore, there
-             --   are two levels of call available.  Defined variables and headers may
-             --   be interrogated directly, and in addition, there are higher-level
-             --   calls which give convenient names and types to the same information.
+             -- | It is common practice for web servers to make their own
+             --   extensions to the CGI/1.1 set of defined variables.  For
+             --   example, @REMOTE_PORT@ is not defined by the specification,
+             --   but often seen in the wild.  Furthermore, it is also common
+             --   for user agents to make their own extensions to the HTTP/1.1
+             --   set of defined headers.  Therefore, there are two levels of
+             --   call available.  Defined variables and headers may be
+             --   interrogated directly, and in addition, there are
+             --   higher-level calls which give convenient names and types to
+             --   the same information.
              --   
-             --   Cookies may also be manipulated through HTTP headers directly; the
-             --   functions here are provided only as a convenience.
+             --   Cookies may also be manipulated through HTTP headers
+             --   directly; the functions here are provided only as a
+             --   convenience.
              getRequestVariable,
              getAllRequestVariables,
              Header(..),
@@ -64,38 +68,41 @@ module Network.HTTP (
              getContentType,
              
              -- * Request content data
-             -- | At the moment the handler is invoked, all request headers have been
-             --   received, but content data has not necessarily been.  Requests to read
-             --   content data block the handler (but not other concurrent handlers)
-             --   until there is enough data in the buffer to satisfy them, or until
-             --   timeout where applicable.
+             -- | At the moment the handler is invoked, all request headers
+             --   have been received, but content data has not necessarily
+             --   been.  Requests to read content data block the handler (but
+             --   not other concurrent handlers) until there is enough data in
+             --   the buffer to satisfy them, or until timeout where
+             --   applicable.
              httpGet,
              httpGetNonBlocking,
              httpGetContents,
              httpIsReadable,
              
              -- * Response information and content data
-             -- | When the handler is first invoked, neither response headers nor
-             --   content data have been sent to the client.  Setting of response
-             --   headers is lazy, merely setting internal variables, until something
-             --   forces them to be output.  For example, attempting to send content
-             --   data will force response headers to be output first.  It is not
-             --   necessary to close the output stream explicitly, but it may be
-             --   desirable, for example to continue processing after returning results
-             --   to the user.
+             -- | When the handler is first invoked, neither response headers
+             --   nor content data have been sent to the client.  Setting of
+             --   response headers is lazy, merely setting internal variables,
+             --   until something forces them to be output.  For example,
+             --   attempting to send content data will force response headers
+             --   to be output first.  It is not necessary to close the output
+             --   stream explicitly, but it may be desirable, for example to
+             --   continue processing after returning results to the user.
              --   
-             --   There is no reason that client scripts cannot use any encoding they
-             --   wish, including the chunked encoding, if they have set appropriate
-             --   headers.  This package, however, does not explicitly support that,
-             --   because client scripts can easily implement it for themselves.
+             --   There is no reason that client scripts cannot use any
+             --   encoding they wish, including the chunked encoding, if they
+             --   have set appropriate headers.  This package, however, does
+             --   not explicitly support that, because client scripts can
+             --   easily implement it for themselves.
              --   
-             --   At the start of each request, the response status is set to @200 OK@
-             --   and the only response header set is @Content-Type: text/html@.  These
-             --   may be overridden by later calls, at any time before headers have
-             --   been sent.
+             --   At the start of each request, the response status is set to
+             --   @200 OK@ and the only response header set is
+             --   @Content-Type: text/html@.  These may be overridden by later
+             --   calls, at any time before headers have been sent.
              --   
-             --   Cookies may also be manipulated through HTTP headers directly; the
-             --   functions here are provided only as a convenience.
+             --   Cookies may also be manipulated through HTTP headers
+             --   directly; the functions here are provided only as a
+             --   convenience.
              setResponseStatus,
              getResponseStatus,
              setResponseHeader,
@@ -116,10 +123,10 @@ module Network.HTTP (
              httpIsWritable,
              
              -- * Exceptions
-             --   Because it is not possible for user code to enter the HTTP monad
-             --   from outside it, catching exceptions in IO will not work.  Therefore
-             --   a full set of exception primitives designed to work with any
-             --   'MonadHTTP' instance is provided.
+             --   Because it is not possible for user code to enter the HTTP
+             --   monad from outside it, catching exceptions in IO will not
+             --   work.  Therefore a full set of exception primitives designed
+             --   to work with any 'MonadHTTP' instance is provided.
              HTTPException(..),
              httpThrow,
              httpCatch,
@@ -299,48 +306,78 @@ getHTTPConnection = do
   return $ fromJust maybeConnection
 
 
--- | A record used to configure the server.  Contains optional paths to files
---   for the access and error logs (if these are omitted, logging is not done),
---   and a flag indicating whether to run as a daemon.  Also contains the names
---   field, which is a list containing one entry for each distinct server; each
---   server entry consists of a list of names to recognize, the first such name
---   being the canonical one, and a list of addresses and ports to bind to, with
---   a flag for each indicating whether the binding should use the secure
---   version of the protocol.
+-- | A record used to configure the server.  Broken informally into the four
+--   categories of logging, job-control, concurrency, and networking.  For
+--   logging, the configuration contains optional paths to files for the
+--   access and error logs (if these are omitted, logging is not done).  For
+--   job-control, it contains a flag indicating whether to run as a daemon,
+--   and optionally the names of a Unix user and/or group to switch to in the
+--   process of daemonization.  For concurrency, it contains a forking
+--   primitive such as 'forkIO' or 'forkOS'.  Finally, for networking, it
+--   contains a list of parameters for ports to listen on, each of which has
+--   its own sub-configuration record.
+--   
+--   Notice that checking the value of the Host: header, and implementing
+--   virtual-host policies, is not done by direct-http but rather is up to the
+--   user of the library; hence, there is no information in the configuration
+--   about the hostnames to accept from the user-agent.
+--  
+--   If the access logfile path is not Nothing, 'acceptLoop' opens this
+--   logfile in append mode and uses it to log all accesses; otherwise, access
+--   is not logged.
+--   
+--   If the error logfile path is not Nothing, 'acceptLoop' opens this logfile
+--   in append mode and uses it to log all errors; otherwise, if not
+--   daemonizing, errors are logged to standard output; if daemonizing, errors
+--   are not logged.
+--   
+--   If the daemonize flag is True, 'acceptLoop' closes the standard IO
+--   streams and moves the process into the background, doing all the usual
+--   Unix things to make it run as a daemon henceforth.  This is optional
+--   because it might be useful to turn it off for debugging purposes.
+--   
+--   The forking primitive is typically either 'forkIO' or 'forkOS', and is
+--   used by 'acceptLoop' both to create listener threads, and to create
+--   connection threads.  It is valid to use a custom primitive, such as one
+--   that attempts to pool OS threads, but it must actually provide
+--   concurrency - otherwise there will be a deadlock. There is no support for
+--   single-threaded operation.
+--   
+--   Notice that we take the forking primitive in terms of 'IO', even though
+--   we actually lift it with 'liftBase'.  This is because lifted-base, as of
+--   this writing and its version 0.1.1, only supports 'forkIO' and not
+--   'forkOS'.
+--   
+--   The author of direct-http has made no effort to implement custom
+--   thread-pooling forking primitives, but has attempted not to preclude
+--   them.  If anyone attempts to implement such a thing, feedback is hereby
+--   solicited.
 data HTTPServerParameters = HTTPServerParameters {
     serverParametersAccessLogPath :: Maybe FilePath,
     serverParametersErrorLogPath :: Maybe FilePath,
     serverParametersDaemonize :: Bool,
     serverParametersUserToChangeTo :: Maybe String,
     serverParametersGroupToChangeTo :: Maybe String,
-    serverParametersNames :: [([Network.HostName],
-                               [(Network.HostAddress,
-                                 Network.PortNumber,
-                                 Bool)])]
+    serverParametersForkPrimitive :: IO () -> IO ThreadId,
+    serverParametersListenSockets :: [HTTPListenSocketParameters]
   }
 
 
--- | Takes a server parameters record, a forking primitive such as 'forkIO'
---   or 'forkOS', and a handler, and concurrently accepts requests from user
---   agents, forking with the primitive and invoking the handler in the forked
---   thread inside the 'HTTP' monad for each one.
---   
---   If the access logfile path is not Nothing, opens this logfile in append
---   mode and uses it to log all accesses; otherwise, access is not logged.
---   
---   If the error logfile path is not Nothing, opens this logfile in append mode
---   and uses it to log all errors; otherwise, if not daemonizing, errors are
---   logged to standard output; if daemonizing, errors are not logged.
---   
---   If the daemonize flag is True, closes the standard IO streams and moves
---   the process into the background, doing all the usual Unix things to make it
---   run as a daemon henceforth.  This is optional because it might be useful to
---   turn it off for debugging purposes.
---   
---   It is valid to use a custom forking primitive, such as one that attempts to
---   pool OS threads, but the primitive must actually provide concurrency -
---   otherwise there will be a deadlock.  There is no support for
---   single-threaded operation.
+-- | A record used to configure an individual port listener and its socket as
+--   part of the general server configuration.  Consists of a host address and
+--   port number to bind the socket to, and a flag indicating whether the
+--   listener should use the secure version of the protocol.
+data HTTPListenSocketParameters = HTTPListenSocketParameters {
+    listenSocketParametersHostAddress :: Network.HostAddress,
+    listenSocketParametersPortNumber :: Network.PortNumber,
+    listenSocketParametersSecure :: Bool
+  }
+
+
+-- | Takes a server parameters record and a handler, and concurrently accepts
+--   requests from user agents, forking with the primitive specified by the
+--   parameters and invoking the handler in the forked thread inside the
+--   'HTTP' monad for each request.
 --   
 --   Note that although there is no mechanism to substitute another type of
 --   monad for HTTP, you can enter your own monad within the handler, much as
@@ -353,17 +390,16 @@ data HTTPServerParameters = HTTPServerParameters {
 acceptLoop
     :: HTTPServerParameters
     -- ^ Parameters describing the behavior of the server to run.
-    -> (IO () -> IO ThreadId)
-    -- ^ A forking primitive, typically either 'forkIO' or 'forkOS'.
     -> (HTTP ())
     -- ^ A handler which is invoked once for each incoming connection.
     -> IO ()
     -- ^ Never actually returns.
-acceptLoop parameters fork handler = do
-  (listenSocket, accessLogMaybeHandle, errorLogMaybeHandle)
+acceptLoop parameters handler = do
+  (listenSockets, accessLogMaybeHandle, errorLogMaybeHandle)
     <- Exception.catch
        (do
-         listenSocket <- createListenSocket
+         listenSockets <-
+           mapM createListenSocket (serverParametersListenSockets parameters)
          accessLogMaybeHandle
            <- case serverParametersAccessLogPath parameters of
                 Nothing -> return Nothing
@@ -376,7 +412,7 @@ acceptLoop parameters fork handler = do
                              else return $ Just stdout
                 Just path -> openBinaryFile path AppendMode
                              >>= return . Just
-         return (listenSocket, accessLogMaybeHandle, errorLogMaybeHandle))
+         return (listenSockets, accessLogMaybeHandle, errorLogMaybeHandle))
         (\e -> do
            hPutStrLn stderr
                      $ "Failed to start: "
@@ -392,52 +428,35 @@ acceptLoop parameters fork handler = do
                 httpStateMaybeConnection = Nothing
               }
   if serverParametersDaemonize parameters
-    then do
-      let maybeHandleMVarToFd maybeHandleMVar = do
-            maybeHandle <- takeMVar maybeHandleMVar
-            case maybeHandle of
-              Nothing -> do
-                putMVar maybeHandleMVar Nothing
-                return Nothing
-              Just handle -> do
-                fd <- POSIX.handleToFd handle
-                handle <- POSIX.fdToHandle fd
-                putMVar maybeHandleMVar $ Just handle
-                return $ Just fd
-      accessLogMaybeFd <- maybeHandleMVarToFd accessLogMaybeHandleMVar
-      errorLogMaybeFd <- maybeHandleMVarToFd errorLogMaybeHandleMVar
-      listenSocketMaybeFd <- return $ Just
-                                    $ POSIX.Fd $ Network.fdSocket listenSocket
-      daemonize (defaultDaemonOptions {
-                   daemonFileDescriptorsToLeaveOpen
-                     = (map fromJust $ filter isJust [accessLogMaybeFd,
-                                                      errorLogMaybeFd,
-                                                      listenSocketMaybeFd]),
-                   daemonUserToChangeTo
-                     = serverParametersUserToChangeTo parameters,
-                   daemonGroupToChangeTo
-                     = serverParametersGroupToChangeTo parameters
-                 })
-                $ acceptLoop' state listenSocket
-    else acceptLoop' state listenSocket
-  where acceptLoop' state listenSocket = do
-          let acceptLoop'' = do
+    then daemonize (defaultDaemonOptions {
+                        daemonUserToChangeTo =
+                          serverParametersUserToChangeTo parameters,
+                        daemonGroupToChangeTo =
+                          serverParametersGroupToChangeTo parameters
+                      })
+                   $ acceptLoop' state listenSockets
+    else acceptLoop' state listenSockets
+  where acceptLoop' state listenSockets = do
+          let fork = serverParametersForkPrimitive parameters
+              acceptLoop'' listenSocket = do
                 (socket, peer) <- liftIO $ Network.accept listenSocket
                 state <- ask
                 liftIO $ fork $ flip runReaderT state
                          $ requestLoop socket peer handler
-                acceptLoop''
+                acceptLoop'' listenSocket
           flip runReaderT state $ do
             httpLog $ "Server started."
-            acceptLoop''
+            mapM_ acceptLoop'' listenSockets
 
 
-createListenSocket :: IO Network.Socket
-createListenSocket = do
+createListenSocket :: HTTPListenSocketParameters -> IO Network.Socket
+createListenSocket parameters = do
+  let address = listenSocketParametersHostAddress parameters
+      port = listenSocketParametersPortNumber parameters
   listenSocket <- Network.socket Network.AF_INET
                                  Network.Stream
                                  Network.defaultProtocol
-  Network.bindSocket listenSocket $ Network.SockAddrInet 80 Network.iNADDR_ANY
+  Network.bindSocket listenSocket $ Network.SockAddrInet port address
   Network.listen listenSocket 1024
   return listenSocket
 

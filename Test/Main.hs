@@ -13,12 +13,12 @@ main = do
                  serverParametersAccessLogPath = Just "access.log",
                  serverParametersErrorLogPath = Just "error.log",
                  serverParametersDaemonize = True,
-                 serverParametersUserToChangeTo = Just "dankna",
-                 serverParametersGroupToChangeTo = Just "dankna",
+                 serverParametersUserToChangeTo = Just "irene",
+                 serverParametersGroupToChangeTo = Just "irene",
                  serverParametersNames
-                   = [(["dankna.com", "localhost"],
-                       [(loopbackAddress, 80, False),
-                        (loopbackAddress, 443, True)])]
+                   = [(["ireneknapp.com", "localhost"],
+                       [(loopbackAddress, 8000, False),
+                        (loopbackAddress, 4430, True)])]
                }
              forkIO
              $ do
