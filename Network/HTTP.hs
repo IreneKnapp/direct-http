@@ -27,17 +27,32 @@ module Network.HTTP (
              --   example, @REMOTE_PORT@ is not defined by the specification,
              --   but often seen in the wild.  Furthermore, it is also common
              --   for user agents to make their own extensions to the HTTP/1.1
-             --   set of defined headers.  Therefore, there are two levels of
-             --   call available.  Defined variables and headers may be
-             --   interrogated directly, and in addition, there are
-             --   higher-level calls which give convenient names and types to
-             --   the same information.
+             --   set of defined headers.  One might therefore expect to see
+             --   functions defined here allowing direct interrogation of
+             --   variables and headers by name.  This is not done, because it
+             --   is not the primary goal of direct-http to be a CGI/FastCGI
+             --   host, and that functionality is trivial for any user code
+             --   implementing such a host to provide.  It would actually be
+             --   rather more difficult for direct-http to provide many of the
+             --   common values, because it does not implement the facilities
+             --   they are supposed to give information about.  Even as simple
+             --   a concept as "what server address is this" must take into
+             --   account name-canonicalization and virtual-host policies,
+             --   which are left to user code.  As for document root, it is
+             --   possible to implement a server with no capacity to serve
+             --   files, in which case the concept is nonsensical.  Enough
+             --   important values are necessarily absent for reasons such as
+             --   these that there is little reason to provide the remaining
+             --   ones either.
+             --   
+             --   Too long, didn't read?  Instead of providing access to
+             --   CGI-like variables, direct-http provides higher-level calls
+             --   which give convenient names and types to the same
+             --   information.  It does provide access to headers, however.
              --   
              --   Cookies may also be manipulated through HTTP headers
              --   directly; the functions here are provided only as a
              --   convenience.
-             getRequestVariable,
-             getAllRequestVariables,
              Header(..),
              getRequestHeader,
              getAllRequestHeaders,
@@ -45,26 +60,10 @@ module Network.HTTP (
              getCookie,
              getAllCookies,
              getCookieValue,
-             getDocumentRoot,
-             getGatewayInterface,
-             getPathInfo,
-             getPathTranslated,
-             getQueryString,
-             getRedirectStatus,
-             getRedirectURI,
              getRemoteAddress,
-             getRemotePort,
-             getRemoteHost,
-             getRemoteIdent,
-             getRemoteUser,
              getRequestMethod,
              getRequestURI,
              getServerAddress,
-             getServerName,
-             getServerPort,
-             getServerProtocol,
-             getServerSoftware,
-             getAuthenticationType,
              getContentLength,
              getContentType,
              
@@ -173,11 +172,11 @@ data HTTPState = HTTPState {
 
 
 data HTTPConnection = HTTPConnection {
+    httpConnectionServerAddress :: Network.SockAddr,
     httpConnectionSocket :: Network.Socket,
     httpConnectionPeer :: Network.SockAddr,
     httpConnectionInputBufferMVar :: MVar ByteString,
     httpConnectionTimestamp :: MVar POSIXTime,
-    httpConnectionQueryString :: MVar (Maybe String),
     httpConnectionRemoteHostname :: MVar (Maybe (Maybe String)),
     httpConnectionRequestMethod :: MVar String,
     httpConnectionRequestURI :: MVar String,
@@ -361,8 +360,7 @@ data HTTPServerParameters = HTTPServerParameters {
 --   port number to bind the socket to, and a flag indicating whether the
 --   listener should use the secure version of the protocol.
 data HTTPListenSocketParameters = HTTPListenSocketParameters {
-    listenSocketParametersHostAddress :: Network.HostAddress,
-    listenSocketParametersPortNumber :: Network.PortNumber,
+    listenSocketParametersAddress :: Network.SockAddr,
     listenSocketParametersSecure :: Bool
   }
 
@@ -457,14 +455,19 @@ acceptLoop parameters handler = do
               threadWaitLoop
 
 
-createListenSocket :: HTTPListenSocketParameters -> IO Network.Socket
+createListenSocket
+  :: HTTPListenSocketParameters -> IO Network.Socket
 createListenSocket parameters = do
-  let address = listenSocketParametersHostAddress parameters
-      port = listenSocketParametersPortNumber parameters
-  listenSocket <- Network.socket Network.AF_INET
+  let address = listenSocketParametersAddress parameters
+      addressFamily =
+        case address of
+          Network.SockAddrInet _ _ -> Network.AF_INET
+          Network.SockAddrInet6 _ _ _ _ -> Network.AF_INET6
+          Network.SockAddrUnix _ -> Network.AF_UNIX
+  listenSocket <- Network.socket addressFamily
                                  Network.Stream
                                  Network.defaultProtocol
-  Network.bindSocket listenSocket $ Network.SockAddrInet port address
+  Network.bindSocket listenSocket address
   Network.listen listenSocket 1024
   return listenSocket
 
@@ -474,9 +477,9 @@ requestLoop :: Network.Socket
             -> HTTP ()
             -> HTTP ()
 requestLoop socket peer handler = do
+  serverAddress <- liftBase $ Network.getSocketName socket
   inputBufferMVar <- newMVar $ BS.empty
   timestampMVar <- newEmptyMVar
-  queryStringMVar <- newEmptyMVar
   remoteHostnameMVar <- newMVar Nothing
   requestMethodMVar <- newEmptyMVar
   requestURIMVar <- newEmptyMVar
@@ -492,11 +495,11 @@ requestLoop socket peer handler = do
   responseContentBufferMVar <- newEmptyMVar
   responseContentParametersMVar <- newEmptyMVar
   let connection = HTTPConnection {
+                     httpConnectionServerAddress = serverAddress,
                      httpConnectionSocket = socket,
                      httpConnectionPeer = peer,
                      httpConnectionInputBufferMVar = inputBufferMVar,
                      httpConnectionTimestamp = timestampMVar,
-                     httpConnectionQueryString = queryStringMVar,
                      httpConnectionRemoteHostname = remoteHostnameMVar,
                      httpConnectionRequestMethod = requestMethodMVar,
                      httpConnectionRequestURI = requestURIMVar,
@@ -529,11 +532,9 @@ requestLoop socket peer handler = do
       requestLoop'' = do
         catch requestLoop'''
               (\error -> do
-                 HTTPConnection {
-                     httpConnectionPeer = Network.SockAddrInet _ address
-                   } <- getHTTPConnection
-                 peerString <- liftBase $ Network.inet_ntoa address
-                 httpLog $ "Connection from " ++ peerString
+                 connection <- getHTTPConnection
+                 httpLog $ "Connection from "
+                           ++ (show $ httpConnectionPeer connection)
                            ++ " terminated due to error: "
                            ++ (show (error :: ConnectionTerminatingError))
                  liftBase $ Network.sClose socket)
@@ -550,7 +551,6 @@ requestLoop socket peer handler = do
           Just (method, url, protocol, headers) -> do
             timestamp <- liftBase getPOSIXTime
             putMVar timestampMVar timestamp
-            putMVar queryStringMVar Nothing -- TODO
             putMVar requestMethodMVar $ UTF8.toString method
             putMVar requestURIMVar $ UTF8.toString url
             putMVar requestProtocolMVar $ UTF8.toString protocol
@@ -586,7 +586,6 @@ requestLoop socket peer handler = do
               then httpCloseOutput
               else return ()
             takeMVar timestampMVar
-            takeMVar queryStringMVar
             takeMVar requestMethodMVar
             takeMVar requestURIMVar
             takeMVar requestProtocolMVar
@@ -651,18 +650,11 @@ prepareResponse = do
 
 logAccess :: (MonadHTTP m) => m ()
 logAccess = do
-  maybePeerString <- getRemoteHost
-  peerString <- case maybePeerString of
-                  Nothing -> do
-                    HTTPConnection { httpConnectionPeer = peer } <- getHTTPConnection
-                    case peer of
-                      Network.SockAddrInet _ address
-                        -> liftBase $ Network.inet_ntoa address
-                  Just peerString -> return peerString
+  remoteHost <- getRemoteHost
   identString <- return "-"
   usernameString <- return "-"
-  HTTPConnection { httpConnectionTimestamp = timestampMVar } <- getHTTPConnection
-  timestamp <- readMVar timestampMVar
+  connection <- getHTTPConnection
+  timestamp <- readMVar (httpConnectionTimestamp connection)
   let timestampString = formatTime defaultTimeLocale
                                    "%-d/%b/%Y:%H:%M:%S %z"
                                    $ posixSecondsToUTCTime timestamp
@@ -683,7 +675,7 @@ logAccess = do
   userAgentString <- case maybeUserAgentString of
                       Nothing -> return "-"
                       Just userAgentString -> return userAgentString
-  httpAccessLog $ peerString
+  httpAccessLog $ remoteHost
                   ++ " "
                   ++ identString
                   ++ " "
@@ -840,8 +832,8 @@ recvHeaders = do
     <- getHTTPConnection
   inputBuffer <- takeMVar inputBufferMVar
   (inputBuffer, maybeLine) <- recvLine inputBuffer
-  result <- case maybeLine of
-    Nothing -> return Nothing
+  (inputBuffer, result) <- case maybeLine of
+    Nothing -> return (inputBuffer, Nothing)
     Just line -> do
       let computeWords input =
             let (before, after) = BS.breakSubstring (UTF8.fromString " ") input
@@ -859,15 +851,16 @@ recvHeaders = do
             let loop inputBuffer headersSoFar = do
                   (inputBuffer, maybeLine) <- recvLine inputBuffer
                   case maybeLine of
-                    Nothing -> return Nothing
+                    Nothing -> return (inputBuffer, Nothing)
                     Just line
                       | BS.null line -> do
-                          return $ Just (method, url, protocol, headersSoFar)
+                          return (inputBuffer,
+                                  Just (method, url, protocol, headersSoFar))
                       | otherwise -> do
                           case parseHeader line of
                             Nothing -> do
                               logInvalidRequest
-                              return Nothing
+                              return (inputBuffer, Nothing)
                             Just (header, value) -> do
                               let headersSoFar'
                                    = case Map.lookup header headersSoFar of
@@ -885,7 +878,7 @@ recvHeaders = do
             loop inputBuffer Map.empty
         _ -> do
           logInvalidRequest
-          return Nothing
+          return (inputBuffer, Nothing)
   putMVar inputBufferMVar inputBuffer
   return result
 
@@ -899,9 +892,10 @@ parseHeader line = do
 
 logInvalidRequest :: MonadHTTP m => m ()
 logInvalidRequest = do
-  HTTPConnection { httpConnectionPeer = Network.SockAddrInet _ address } <- getHTTPConnection
-  peerString <- liftBase $ Network.inet_ntoa address
-  httpLog $ "Invalid request from " ++ peerString ++ "; closing its connection."
+  connection <- getHTTPConnection
+  httpLog $ "Invalid request from "
+            ++ (show $ httpConnectionPeer connection)
+            ++ "; closing its connection."
 
 
 isValidMethod :: ByteString -> Bool
@@ -1239,71 +1233,6 @@ toHeader bytestring
   | otherwise = HttpExtensionHeader bytestring
 
 
-requestVariableNameIsHeader :: String -> Bool
-requestVariableNameIsHeader name = (length name > 5) && (take 5 name == "HTTP_")
-
-
-requestVariableNameToHeaderName :: String -> Maybe ByteString
-requestVariableNameToHeaderName name
-    = if requestVariableNameIsHeader name
-        then let split [] = []
-                 split string = case elemIndex '_' string of
-                                  Nothing -> [string]
-                                  Just index ->
-                                    let (first, rest) = splitAt index string
-                                    in first : (split $ drop 1 rest)
-                 titleCase word = [toUpper $ head word] ++ (map toLower $ tail word)
-                 headerName = intercalate "-" $ map titleCase $ split $ drop 5 name
-             in Just $ UTF8.fromString headerName
-        else Nothing
-
-
-requestVariableNameToHeader :: String -> Maybe Header
-requestVariableNameToHeader "HTTP_ACCEPT" = Just HttpAccept
-requestVariableNameToHeader "HTTP_ACCEPT_CHARSET" = Just HttpAcceptCharset
-requestVariableNameToHeader "HTTP_ACCEPT_ENCODING" = Just HttpAcceptEncoding
-requestVariableNameToHeader "HTTP_ACCEPT_LANGUAGE" = Just HttpAcceptLanguage
-requestVariableNameToHeader "HTTP_AUTHORIZATION" = Just HttpAuthorization
-requestVariableNameToHeader "HTTP_EXPECT" = Just HttpExpect
-requestVariableNameToHeader "HTTP_FROM" = Just HttpFrom
-requestVariableNameToHeader "HTTP_HOST" = Just HttpHost
-requestVariableNameToHeader "HTTP_IF_MATCH" = Just HttpIfMatch
-requestVariableNameToHeader "HTTP_IF_MODIFIED_SINCE" = Just HttpIfModifiedSince
-requestVariableNameToHeader "HTTP_IF_NONE_MATCH" = Just HttpIfNoneMatch
-requestVariableNameToHeader "HTTP_IF_RANGE" = Just HttpIfRange
-requestVariableNameToHeader "HTTP_IF_UNMODIFIED_SINCE" = Just HttpIfUnmodifiedSince
-requestVariableNameToHeader "HTTP_MAX_FORWARDS" = Just HttpMaxForwards
-requestVariableNameToHeader "HTTP_PROXY_AUTHORIZATION" = Just HttpProxyAuthorization
-requestVariableNameToHeader "HTTP_RANGE" = Just HttpRange
-requestVariableNameToHeader "HTTP_REFERER" = Just HttpReferrer
-requestVariableNameToHeader "HTTP_TE" = Just HttpTE
-requestVariableNameToHeader "HTTP_USER_AGENT" = Just HttpUserAgent
-requestVariableNameToHeader "HTTP_ALLOW" = Just HttpAllow
-requestVariableNameToHeader "HTTP_CONTENT_ENCODING" = Just HttpContentEncoding
-requestVariableNameToHeader "HTTP_CONTENT_LANGUAGE" = Just HttpContentLanguage
-requestVariableNameToHeader "HTTP_CONTENT_LENGTH" = Just HttpContentLength
-requestVariableNameToHeader "HTTP_CONTENT_LOCATION" = Just HttpContentLocation
-requestVariableNameToHeader "HTTP_CONTENT_MD5" = Just HttpContentMD5
-requestVariableNameToHeader "HTTP_CONTENT_RANGE" = Just HttpContentRange
-requestVariableNameToHeader "HTTP_CONTENT_TYPE" = Just HttpContentType
-requestVariableNameToHeader "HTTP_EXPIRES" = Just HttpExpires
-requestVariableNameToHeader "HTTP_LAST_MODIFIED" = Just HttpLastModified
-requestVariableNameToHeader "HTTP_CACHE_CONTROL" = Just HttpCacheControl
-requestVariableNameToHeader "HTTP_CONNECTION" = Just HttpConnection
-requestVariableNameToHeader "HTTP_DATE" = Just HttpDate
-requestVariableNameToHeader "HTTP_PRAGMA" = Just HttpPragma
-requestVariableNameToHeader "HTTP_TRAILER" = Just HttpTrailer
-requestVariableNameToHeader "HTTP_TRANSFER_ENCODING" = Just HttpTransferEncoding
-requestVariableNameToHeader "HTTP_UPGRADE" = Just HttpUpgrade
-requestVariableNameToHeader "HTTP_VIA" = Just HttpVia
-requestVariableNameToHeader "HTTP_WARNING" = Just HttpWarning
-requestVariableNameToHeader "HTTP_COOKIE" = Just HttpCookie
-requestVariableNameToHeader name
-    = if requestVariableNameIsHeader name
-        then Just $ HttpExtensionHeader $ fromJust $ requestVariableNameToHeaderName name
-        else Nothing
-
-
 isValidInRequest :: Header -> Bool
 isValidInRequest header = (headerType header == RequestHeader)
                           || (headerType header == EntityHeader)
@@ -1320,115 +1249,15 @@ isValidOnlyWithEntity :: Header -> Bool
 isValidOnlyWithEntity header = headerType header == EntityHeader
 
 
--- | Queries the value of the CGI/1.1 request variable with the
---   given name for this request.  This interface is provided as a convenience to
---   programs which were originally written against the CGI or FastCGI APIs.
-getRequestVariable
-    :: (MonadHTTP m)
-    => String -- ^ The name of the request variable to query.
-    -> m (Maybe String) -- ^ The value of the request variable.
-getRequestVariable "DOCUMENT_ROOT" = getDocumentRoot
-getRequestVariable "GATEWAY_INTERFACE" = getGatewayInterface
-getRequestVariable "PATH_INFO" = getPathInfo
-getRequestVariable "PATH_TRANSLATED" = getPathTranslated
-getRequestVariable "QUERY_STRING" = getQueryString
-getRequestVariable "REDIRECT_STATUS" = do
-  maybeResult <- getRedirectStatus
-  case maybeResult of
-    Nothing -> return Nothing
-    Just result -> return $ Just $ show result
-getRequestVariable "REDIRECT_URI" = getRedirectURI
-getRequestVariable "REMOTE_ADDR" = do
-  maybeResult <- getRemoteAddress
-  case maybeResult of
-    Nothing -> return Nothing
-    Just result -> do
-      result <- liftBase $ Network.inet_ntoa result
-      return $ Just result
-getRequestVariable "REMOTE_PORT" = do
-  maybeResult <- getRemotePort
-  case maybeResult of
-    Nothing -> return Nothing
-    Just result -> return $ Just $ show result
-getRequestVariable "REMOTE_HOST" = getRemoteHost
-getRequestVariable "REMOTE_IDENT" = getRemoteIdent
-getRequestVariable "REMOTE_USER" = getRemoteUser
-getRequestVariable "REQUEST_METHOD" = getRequestMethod >>= return . Just
-getRequestVariable "REQUEST_URI" = getRequestURI >>= return . Just
-getRequestVariable "SERVER_ADDR" = do
-  maybeResult <- getServerAddress
-  case maybeResult of
-    Nothing -> return Nothing
-    Just result -> do
-      result <- liftBase $ Network.inet_ntoa result
-      return $ Just result
-getRequestVariable "SERVER_NAME" = getServerName
-getRequestVariable "SERVER_PORT" = do
-  maybeResult <- getServerPort
-  case maybeResult of
-    Nothing -> return Nothing
-    Just result -> return $ Just $ show result
-getRequestVariable "SERVER_PROTOCOL" = getServerProtocol
-getRequestVariable "SERVER_SOFTWARE" = getServerSoftware
-getRequestVariable "AUTH_TYPE" = getAuthenticationType
-getRequestVariable "CONTENT_LENGTH" = do
-  maybeResult <- getContentLength
-  case maybeResult of
-    Nothing -> return Nothing
-    Just result -> return $ Just $ show result
-getRequestVariable "CONTENT_TYPE" = getContentType
-getRequestVariable string
-  | requestVariableNameIsHeader string
-    = getRequestHeader $ fromJust $ requestVariableNameToHeader string
-  | otherwise = return Nothing
-
-
--- | Returns an association list of name-value pairs of all the CGI/1.1 request
---   variables from the web server.  This interface is provided as a convenience
---   to programs which were originally written against the CGI or FastCGI APIs.
---   Its use is not recommended if only some values are needed, because it
---   implicitly calls getRemoteHost and getRemoteIdent, which are potentially
---   time-consuming.
-getAllRequestVariables
-    :: (MonadHTTP m) => m [(String, String)]
-getAllRequestVariables = do
-  result
-    <- mapM (\name -> do
-               maybeValue <- getRequestVariable name
-               case maybeValue of
-                 Nothing -> return Nothing
-                 Just value -> return $ Just (name, value))
-            ["DOCUMENT_ROOT", "GATEWAY_INTERFACE", "PATH_INFO",
-             "PATH_TRANSLATED", "QUERY_STRING", "REDIRECT_STATUS",
-             "REDIRECT_URI", "REMOTE_ADDR", "REMOTE_PORT", "REMOTE_HOST",
-             "REMOTE_IDENT", "REMOTE_USER", "REQUEST_METHOD", "REQUEST_URI",
-             "SCRIPT_FILENAME", "SCRIPT_NAME", "SERVER_ADDR", "SERVER_NAME",
-             "SERVER_PORT", "SERVER_PROTOCOL", "SERVER_SOFTWARE", "AUTH_TYPE",
-             "CONTENT_LENGTH", "CONTENT_TYPE", "HTTP_ACCEPT",
-             "HTTP_ACCEPT_CHARSET", "HTTP_ACCEPT_ENCODING",
-             "HTTP_ACCEPT_LANGUAGE", "HTTP_AUTHORIZATION", "HTTP_EXPECT",
-             "HTTP_FROM", "HTTP_HOST", "HTTP_IF_MATCH",
-             "HTTP_IF_MODIFIED_SINCE", "HTTP_IF_NONE_MATCH", "HTTP_IF_RANGE",
-             "HTTP_IF_UNMODIFIED_SINCE", "HTTP_MAX_FORWARDS",
-             "HTTP_PROXY_AUTHORIZATION", "HTTP_RANGE", "HTTP_REFERER",
-             "HTTP_TE", "HTTP_USER_AGENT", "HTTP_ALLOW",
-             "HTTP_CONTENT_ENCODING", "HTTP_CONTENT_LANGUAGE",
-             "HTTP_CONTENT_LENGTH", "HTTP_CONTENT_LOCATION",
-             "HTTP_CONTENT_MD5", "HTTP_CONTENT_RANGE", "HTTP_CONTENT_TYPE",
-             "HTTP_EXPIRES", "HTTP_LAST_MODIFIED", "HTTP_CACHE_CONTROL",
-             "HTTP_CONNECTION", "HTTP_DATE", "HTTP_PRAGMA", "HTTP_TRAILER",
-             "HTTP_TRANSFER_ENCODING", "HTTP_UPGRADE", "HTTP_VIA",
-             "HTTP_WARNING", "HTTP_COOKIE"]
-  return $ map fromJust $ filter isJust result
-
-
--- | Queries the value from the user agent of the given HTTP/1.1 header.  If the
---   header is to be provided after the content as specified by the Trailer
---   header, this is potentially time-consuming.
+-- | Queries the value from the user agent of the given HTTP/1.1 header.  If
+--   the header is to be provided after the content as specified by the
+--   Trailer header, this is potentially time-consuming.
 getRequestHeader
     :: (MonadHTTP m)
-    => Header -- ^ The header to query.  Must be a request or entity header.
-    -> m (Maybe String) -- ^ The value of the header, if the user agent provided one.
+    => Header
+    -- ^ The header to query.  Must be a request or entity header.
+    -> m (Maybe String)
+    -- ^ The value of the header, if the user agent provided one.
 getRequestHeader header = do
   HTTPConnection { httpConnectionRequestHeaderMap = mvar } <- getHTTPConnection
   headerMap <- readMVar mvar
@@ -1497,118 +1326,38 @@ getCookieValue name = do
   -- TODO
 
 
--- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
---   the corresponding function would return the document root.
-getDocumentRoot :: (MonadHTTP m) => m (Maybe String)
-getDocumentRoot = do
-  return Nothing
-
-
--- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
---   the corresponding function would return the gateway interface.
-getGatewayInterface :: (MonadHTTP m) => m (Maybe String)
-getGatewayInterface = do
-  return Nothing
-
-
--- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
---   the corresponding function would return the path info.
-getPathInfo :: (MonadHTTP m) => m (Maybe String)
-getPathInfo = do
-  return Nothing
-
-
--- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
---   the corresponding function would return the path-translated value.
-getPathTranslated :: (MonadHTTP m) => m (Maybe String)
-getPathTranslated = do
-  return Nothing
-
-
--- | Return the query string, as provided by the user agent.
-getQueryString :: (MonadHTTP m) => m (Maybe String)
-getQueryString = do
-  HTTPConnection { httpConnectionQueryString = mvar } <- getHTTPConnection
-  readMVar mvar
-
-
--- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
---   the corresponding function would return the redirect status.
-getRedirectStatus :: (MonadHTTP m) => m (Maybe Int)
-getRedirectStatus = do
-  return Nothing
-
-
--- | Return Nothing.  Provided for compatibility with direct-fastcgi, in which
---   the corresponding function would return the redirect URI.
-getRedirectURI :: (MonadHTTP m) => m (Maybe String)
-getRedirectURI = do
-  return Nothing
-
-
--- | Return the remote address.
-getRemoteAddress :: (MonadHTTP m) => m (Maybe Network.HostAddress)
+-- | Return the remote address, which includes both host and port information.
+--   They are provided in the aggregate like this because it is the most
+--   internet-protocol-agnostic representation.
+getRemoteAddress :: (MonadHTTP m) => m Network.SockAddr
 getRemoteAddress = do
-  HTTPConnection { httpConnectionPeer = peer } <- getHTTPConnection
-  case peer of
-    Network.SockAddrInet _ address -> return $ Just address
-
-
--- | Return the remote port.
-getRemotePort :: (MonadHTTP m) => m (Maybe Int)
-getRemotePort = do
-  HTTPConnection { httpConnectionPeer = peer } <- getHTTPConnection
-  case peer of
-    Network.SockAddrInet port _ -> do
-      return $ Just $ fromIntegral port
+  connection <- getHTTPConnection
+  return $ httpConnectionPeer connection
 
 
 -- | Return the remote hostname, as determined by the web server.  If it has
 --   not yet been looked up, performs the lookup.  This is potentially
 --   time-consuming.
-getRemoteHost :: (MonadHTTP m) => m (Maybe String)
+getRemoteHost :: (MonadHTTP m) => m String
 getRemoteHost = do
-  HTTPConnection { httpConnectionRemoteHostname = mvar } <- getHTTPConnection
+  connection <- getHTTPConnection
+  let mvar = httpConnectionRemoteHostname connection
   maybeMaybeHostname <- readMVar mvar
   case maybeMaybeHostname of
     Nothing -> do
-      HTTPConnection { httpConnectionPeer = peer } <- getHTTPConnection
-      inputHostname <- case peer of
-        Network.SockAddrInet _ address -> do
-          string <- liftBase $ Network.inet_ntoa address
-          return string
-      maybeValues <- liftBase $ Network.getAddrInfo
-                                  (Just $ Network.defaultHints {
-                                              Network.addrFlags =
-                                                [Network.AI_CANONNAME]
-                                            })
-                                  (Just inputHostname)
-                                  Nothing
-      let maybeHostname = case maybeValues of
-                            (Network.AddrInfo {
-                                        Network.addrCanonName = Just result
-                                      }:_)
-                              -> Just result
-                            _ -> Nothing
-      swapMVar mvar $ Just maybeHostname
-      return maybeHostname
-    Just maybeHostname -> return maybeHostname
-
-
--- | Return the remote ident value, as determined by the web server.  If it has
---   not yet been looked up, performs the lookup.  This is potentially
---   time-consuming.  Not yet implemented; currently, always returns Nothing.
-getRemoteIdent :: (MonadHTTP m) => m (Maybe String)
-getRemoteIdent = do
-  return Nothing
-
-
--- | Return the remote user name.  Not yet implemented; currently, always
---   returns Nothing.
-getRemoteUser :: (MonadHTTP m) => m (Maybe String)
-getRemoteUser = do
-  return Nothing
-  -- TODO
+      catch (do
+               (maybeHostname, _) <-
+                 liftBase $ Network.getNameInfo [] True False
+                             (httpConnectionPeer connection)
+               swapMVar mvar $ Just maybeHostname
+               case maybeHostname of
+                 Nothing -> return $ show (httpConnectionPeer connection)
+                 Just hostname -> return hostname)
+            (\exception -> do
+               return (exception :: SomeException)
+               return $ show (httpConnectionPeer connection))
+    Just Nothing -> return $ show (httpConnectionPeer connection)
+    Just (Just hostname) -> return hostname
 
 
 -- | Return the request method.
@@ -1631,45 +1380,19 @@ getRequestProtocol = do
   readMVar (httpConnectionRequestProtocol connection)
 
 
--- | Return the server address.
-getServerAddress :: (MonadHTTP m) => m (Maybe Network.HostAddress)
+-- | Return the server address and port, as a 'Network.SockAddr'.  Useful
+--   for implementing virtual-hosting policies.
+getServerAddress :: (MonadHTTP m) => m Network.SockAddr
 getServerAddress = do
-  return Nothing
-  -- TODO
+  connection <- getHTTPConnection
+  return $ httpConnectionServerAddress connection
 
 
--- | Return the server name.
-getServerName :: (MonadHTTP m) => m (Maybe String)
-getServerName = do
-  return Nothing
-  -- TODO
-
-
--- | Return the server port.
-getServerPort :: (MonadHTTP m) => m (Maybe Int)
-getServerPort = do
-  return Nothing
-  -- TODO
-
-
--- | Return the server protocol.
-getServerProtocol :: (MonadHTTP m) => m (Maybe String)
-getServerProtocol = do
-  return Nothing
-  -- TODO
-
-
--- | Return the server software name and version.
-getServerSoftware :: (MonadHTTP m) => m (Maybe String)
-getServerSoftware = do
-  return $ Just "direct-http 1.0"
-
-
--- | Return the authentication type.
-getAuthenticationType :: (MonadHTTP m) => m (Maybe String)
-getAuthenticationType = do
-  return Nothing
-  -- TODO
+-- | Return whether the connection is via the secure version of the
+--   protocol.  Useful for implementing virtual-hosting policies.
+getServerSecure :: (MonadHTTP m) => m Bool
+getServerSecure = do
+  return False
 
 
 -- | Return the request content length, if this is knowable without actually

@@ -1,4 +1,5 @@
 Un-fromJust everything.
-Implement getServerAddress.
 IPv6-ify everything.
-
+Implement HTTPS.
+Implement cookies.
+Implement chunked.
