@@ -40,6 +40,7 @@ main = do
                  serverParametersListenSockets = listenSockets
                }
              $ do
+                 setResponseHeader HttpContentLength (show 6)
                  httpPutStr $ "Hello!"
                  -- inputData <- httpGet 4096
                  -- httpPutStr $ "Received " ++ (show $ BS.length inputData) ++ " bytes."

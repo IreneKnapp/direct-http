@@ -1,5 +1,5 @@
-Un-fromJust everything.
-IPv6-ify everything.
 Implement HTTPS.
 Implement cookies.
 Implement chunked.
+Implement compression.
+
