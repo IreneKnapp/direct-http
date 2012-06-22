@@ -181,6 +181,7 @@ data HTTPConnection = HTTPConnection {
     httpConnectionRequestURI :: MVar String,
     httpConnectionRequestProtocol :: MVar String,
     httpConnectionRequestHeaderMap :: MVar (Map Header ByteString),
+    httpConnectionRequestCookieMap :: MVar (Maybe (Map String Cookie)),
     httpConnectionRequestContentBuffer :: MVar ByteString,
     httpConnectionRequestContentParameters :: MVar RequestContentParameters,
     httpConnectionResponseHeadersSent :: MVar Bool,
@@ -488,6 +489,7 @@ requestLoop socket peer handler = do
   requestURIMVar <- newEmptyMVar
   requestProtocolMVar <- newEmptyMVar
   requestHeaderMapMVar <- newEmptyMVar
+  requestCookieMapMVar <- newEmptyMVar
   requestContentBufferMVar <- newEmptyMVar
   requestContentParametersMVar <- newEmptyMVar
   responseHeadersSentMVar <- newEmptyMVar
@@ -508,6 +510,7 @@ requestLoop socket peer handler = do
                      httpConnectionRequestURI = requestURIMVar,
                      httpConnectionRequestProtocol = requestProtocolMVar,
                      httpConnectionRequestHeaderMap = requestHeaderMapMVar,
+                     httpConnectionRequestCookieMap = requestCookieMapMVar,
                      httpConnectionRequestContentBuffer
                        = requestContentBufferMVar,
                      httpConnectionRequestContentParameters
@@ -558,6 +561,7 @@ requestLoop socket peer handler = do
             putMVar requestURIMVar $ UTF8.toString url
             putMVar requestProtocolMVar $ UTF8.toString protocol
             putMVar requestHeaderMapMVar headers
+            putMVar requestCookieMapMVar Nothing
             putMVar requestContentBufferMVar BS.empty
             putMVar requestContentParametersMVar RequestContentUninitialized
             putMVar responseHeadersSentMVar False
@@ -596,6 +600,7 @@ requestLoop socket peer handler = do
                 takeMVar requestURIMVar
                 takeMVar requestProtocolMVar
                 takeMVar requestHeaderMapMVar
+                takeMVar requestCookieMapMVar
                 takeMVar requestContentBufferMVar
                 takeMVar requestContentParametersMVar
                 takeMVar responseHeadersSentMVar
@@ -617,9 +622,8 @@ getRequestValid :: (MonadHTTP m) => m Bool
 getRequestValid = do
   hasContent <- getRequestHasContent
   let getHeadersValid = do
-        HTTPConnection { httpConnectionRequestHeaderMap = mvar }
-          <- getHTTPConnection
-        headerMap <- readMVar mvar
+        connection <- getHTTPConnection
+        headerMap <- readMVar $ httpConnectionRequestHeaderMap connection
         return $ all (\header -> (isValidInRequest header)
                                  && (hasContent
                                      || (not $ isValidOnlyWithEntity header)))
@@ -1290,8 +1294,8 @@ getRequestHeader
     -> m (Maybe String)
     -- ^ The value of the header, if the user agent provided one.
 getRequestHeader header = do
-  HTTPConnection { httpConnectionRequestHeaderMap = mvar } <- getHTTPConnection
-  headerMap <- readMVar mvar
+  connection <- getHTTPConnection
+  headerMap <- readMVar $ httpConnectionRequestHeaderMap connection
   return $ fmap (stripHeaderValueWhitespace . UTF8.toString)
                 $ Map.lookup header headerMap
 
@@ -1321,8 +1325,8 @@ isHeaderValueWhitespace char = elem char " \t\r\n"
 --   potentially time-consuming.
 getAllRequestHeaders :: (MonadHTTP m) => m [(Header, String)]
 getAllRequestHeaders = do
-  HTTPConnection { httpConnectionRequestHeaderMap = mvar } <- getHTTPConnection
-  headerMap <- readMVar mvar
+  connection <- getHTTPConnection
+  headerMap <- readMVar $ httpConnectionRequestHeaderMap connection
   return $ map (\(header, bytestring) -> (header, UTF8.toString bytestring))
                $ Map.toList headerMap
 
@@ -1334,20 +1338,20 @@ getCookie
     => String -- ^ The name of the cookie to look for.
     -> m (Maybe Cookie) -- ^ The cookie, if the user agent provided it.
 getCookie name = do
-  return Nothing
-  -- TODO
+  cookieMap <- getRequestCookieMap
+  return $ Map.lookup name cookieMap
 
 
 -- | Returns all 'Cookie' objects provided by the user agent in accordance 
 --   RFC 2109.
 getAllCookies :: (MonadHTTP m) => m [Cookie]
 getAllCookies = do
-  return []
-  -- TODO
+  cookieMap <- getRequestCookieMap
+  return $ Map.elems cookieMap
 
 
--- | A convenience method; as 'getCookie', but returns only the value of the cookie
---   rather than a 'Cookie' object.
+-- | A convenience method; as 'getCookie', but returns only the value of the
+--   cookie rather than a 'Cookie' object.
 getCookieValue
     :: (MonadHTTP m)
     => String
@@ -1355,8 +1359,29 @@ getCookieValue
     -> m (Maybe String)
     -- ^ The value of the cookie, if the user agent provided it.
 getCookieValue name = do
-  return Nothing
-  -- TODO
+  cookieMap <- getRequestCookieMap
+  return $ fmap cookieValue $ Map.lookup name cookieMap
+
+
+getRequestCookieMap :: (MonadHTTP m) => m (Map String Cookie)
+getRequestCookieMap = do
+  connection <- getHTTPConnection
+  let mvar = httpConnectionRequestCookieMap connection
+  maybeCookieMap <- takeMVar mvar
+  case maybeCookieMap of
+    Just cookieMap -> do
+      putMVar mvar maybeCookieMap
+      return cookieMap
+    Nothing -> do
+      maybeCookieString <- getRequestHeader HttpCookie
+      let cookieMap =
+            case maybeCookieString of
+              Nothing -> Map.empty
+              Just cookieString ->
+                Map.fromList (map (\cookie -> (cookieName cookie, cookie))
+                                  (parseCookies cookieString))
+      putMVar mvar (Just cookieMap)
+      return cookieMap
 
 
 -- | Return the remote address, which includes both host and port information.
@@ -1745,14 +1770,12 @@ setCookie cookie = do
   requireResponseHeadersNotYetSent
   requireResponseHeadersModifiable
   requireValidCookieName $ cookieName cookie
-  {-
-  HTTPConnection { request = Just request } <- getHTTPConnection
-  responseCookieMap <- takeMVar $ responseCookieMapMVar request
-  let responseCookieMap' = Map.insert (cookieName cookie) cookie responseCookieMap
-  putMVar (responseCookieMapMVar request) responseCookieMap'
-  -}
-  return ()
-  -- TODO
+  connection <- getHTTPConnection
+  let mvar = httpConnectionResponseCookieMap connection
+  responseCookieMap <- takeMVar mvar
+  let responseCookieMap' =
+        Map.insert (cookieName cookie) cookie responseCookieMap
+  putMVar mvar responseCookieMap'
 
 
 -- | Causes the user agent to unset any cookie applicable to this page with the
@@ -1772,14 +1795,12 @@ unsetCookie name = do
   requireResponseHeadersNotYetSent
   requireResponseHeadersModifiable
   requireValidCookieName name
-  {-
-  HTTPConnection { request = Just request } <- getHTTPConnection
-  responseCookieMap <- takeMVar $ responseCookieMapMVar request
-  let responseCookieMap' = Map.insert name (mkUnsetCookie name) responseCookieMap
-  putMVar (responseCookieMapMVar request) responseCookieMap'
-  -}
-  return ()
-  -- TODO
+  connection <- getHTTPConnection
+  let mvar = httpConnectionResponseCookieMap connection
+  responseCookieMap <- takeMVar mvar
+  let responseCookieMap' =
+        Map.insert name (mkUnsetCookie name) responseCookieMap
+  putMVar mvar responseCookieMap'
 
 
 -- | Constructs a cookie with the given name and value.  Version is set to 1;

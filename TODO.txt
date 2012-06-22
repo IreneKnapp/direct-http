@@ -1,5 +1,4 @@
 Implement HTTPS.
-Implement cookies.
 Implement chunked.
 Implement compression.
 
