@@ -1,5 +1,11 @@
 {-# LANGUAGE TypeSynonymInstances, FlexibleInstances, FlexibleContexts,
              DeriveDataTypeable #-}
+-- | This module provides facilities for implementing webservers, in a
+--   servelet-like style.  The general philosophy is that direct-http makes
+--   as few decisions as possible for the user code, allowing such things as
+--   URL routing and virtual-host policies to be implemented in any desired
+--   fashion.  It focuses on providing a robust transport layer which can
+--   integrate well with any higher layer.
 module Network.HTTP (
              -- * The monad
              HTTP,

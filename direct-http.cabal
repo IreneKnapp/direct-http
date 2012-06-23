@@ -1,5 +1,5 @@
 name: direct-http
-version: 0.5
+version: 0.5.0.1
 cabal-version: >= 1.10
 build-type: Simple
 license: BSD3
@@ -22,7 +22,7 @@ description:
   to it, and makes several design decisions differently.  The biggest is the
   use of MonadControlBase for exceptions.
   .
-  Version 0.5: This preliminary release is a preview to gauge community
+  Version 0.5.0.1: This preliminary release is a preview to gauge community
   interest.  Not even all major features are implemented; things that exist
   only as stubs include encryption, compression, chunking, and reading back
   cookies.  Nonetheless it may be useful if run behind a reverse proxy that
