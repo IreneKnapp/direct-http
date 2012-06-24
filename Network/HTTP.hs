@@ -153,6 +153,7 @@ import Foreign.C.Error
 import GHC.IO.Exception (IOErrorType(..))
 import qualified Network.Socket as Network hiding (send, sendTo, recv, recvFrom)
 import qualified Network.Socket.ByteString as Network
+import Numeric
 import Prelude hiding (catch)
 import System.Daemonize
 import System.Environment
@@ -1584,7 +1585,7 @@ ensureRequestContentParametersInitialized RequestContentUninitialized = do
             (_, Just _) -> (True, True)
   if hasContent
     then if chunked
-           then return $ RequestContentChunked False 0
+           then return $ RequestContentChunked 0
            else case maybeLength of
              Nothing -> return $ RequestContentNone
              Just length -> return $ RequestContentIdentity length
@@ -2157,11 +2158,21 @@ httpPut bytestring = do
           send bytestring
           return (buffer, parameters')
     ResponseContentChunked -> do
-      httpLog $ "Chunked not implemented."
-      putMVar parametersMVar parameters
-      putMVar bufferMVar buffer
-      throwIO UnexpectedEndOfInput
-      -- TODO
+      alreadySent <- takeMVar alreadySentMVar
+      if alreadySent
+        then return ()
+        else do
+          headersBuffer <- getHeadersBuffer
+          send headersBuffer
+      putMVar alreadySentMVar True
+      if BS.length bytestring > 0
+        then do
+          let lengthBuffer =
+                UTF8.fromString $ showHex (BS.length bytestring) "" ++ "\r\n"
+              crlfBuffer = UTF8.fromString "\r\n"
+          send $ BS.concat [lengthBuffer, bytestring, crlfBuffer]
+        else return ()
+      return (buffer, parameters)
   putMVar parametersMVar parameters
   putMVar bufferMVar buffer
 
@@ -2217,11 +2228,10 @@ flushResponseContent = do
           throwIO OutputIncomplete
         else return ()
     ResponseContentChunked -> do
-      httpLog $ "Chunked not implemented."
+      let emptyChunkBuffer = UTF8.fromString $ "0\r\n\r\n\r\n"
+      send emptyChunkBuffer
       putMVar parametersMVar parameters
       putMVar bufferMVar buffer
-      throwIO UnexpectedEndOfInput
-      -- TODO
   putMVar parametersMVar ResponseContentClosed
   putMVar bufferMVar BS.empty
 

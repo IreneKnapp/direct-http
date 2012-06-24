@@ -35,12 +35,13 @@ main = do
                  serverParametersErrorLogPath = Just "error.log",
                  serverParametersDaemonize = True,
                  serverParametersUserToChangeTo = Just "irene",
-                 serverParametersGroupToChangeTo = Just "irene",
+                 serverParametersGroupToChangeTo = Just "staff",
                  serverParametersForkPrimitive = forkIO,
                  serverParametersListenSockets = listenSockets
                }
              $ do
-                 setResponseHeader HttpContentLength (show 6)
+                 setResponseHeader HttpTransferEncoding "chunked"
+                 -- setResponseHeader HttpContentLength (show 6)
                  httpPutStr $ "Hello!"
                  -- inputData <- httpGet 4096
                  -- httpPutStr $ "Received " ++ (show $ BS.length inputData) ++ " bytes."
