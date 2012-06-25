@@ -206,7 +206,7 @@ data RequestContentParameters
   | RequestContentNone
   | RequestContentClosed
   | RequestContentIdentity Int
-  | RequestContentChunked Bool Int
+  | RequestContentChunked Int
 
 data ResponseContentParameters
   = ResponseContentUninitialized
@@ -1637,10 +1637,10 @@ extendRequestContentBuffer highLevelBuffer
                 if not blocking || isAtLeastTargetLength highLevelBuffer
                   then return (highLevelBuffer', lowLevelBuffer', parameters')
                   else loop highLevelBuffer' lowLevelBuffer' parameters'
-              RequestContentChunked _ _ -> do
+              RequestContentChunked _ -> do
                  httpLog $ "Don't understand chunked."
                  throwIO UnexpectedEndOfInput
-                 -- TODO
+                 -- TODO IAK
   HTTPConnection { httpConnectionInputBufferMVar = lowLevelBufferMVar }
     <- getHTTPConnection
   lowLevelBuffer <- takeMVar lowLevelBufferMVar
