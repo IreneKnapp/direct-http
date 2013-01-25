@@ -130,6 +130,8 @@ module Network.HTTP (
     where
 
 import Control.Concurrent.Lifted
+import Control.Concurrent.MSem (MSem)
+import qualified Control.Concurrent.MSem as MSem
 import Control.Exception.Lifted
 import Control.Monad.Base
 import Control.Monad.Reader
@@ -172,7 +174,7 @@ data HTTPState = HTTPState {
     httpStateErrorLogMaybeHandleMVar :: MVar (Maybe Handle),
     httpStateForkPrimitive :: IO () -> IO ThreadId,
     httpStateThreadSetMVar :: MVar (Set ThreadId),
-    httpStateThreadTerminationQSem :: QSem,
+    httpStateThreadTerminationMSem :: MSem Word,
     httpStateMaybeConnection :: Maybe HTTPConnection
   }
 
@@ -287,7 +289,7 @@ httpFork :: (MonadHTTP m) => m () -> m ThreadId
 httpFork action = do
   state <- getHTTPState
   let mvar = httpStateThreadSetMVar state
-      qsem = httpStateThreadTerminationQSem state
+      msem = httpStateThreadTerminationMSem state
   threadSet <- takeMVar mvar
   childThread <- liftBaseDiscard (httpStateForkPrimitive state)
     $ finally action
@@ -296,7 +298,7 @@ httpFork action = do
                 self <- myThreadId
                 let threadSet' = Set.delete self threadSet'
                 putMVar mvar threadSet'
-                signalQSem qsem)
+                liftBase $ MSem.signal msem)
   let threadSet' = Set.insert childThread threadSet
   putMVar mvar threadSet'
   return childThread
@@ -424,13 +426,13 @@ acceptLoop parameters handler = do
   errorLogMaybeHandleMVar <- newMVar errorLogMaybeHandle
   let forkPrimitive = serverParametersForkPrimitive parameters
   threadSetMVar <- newMVar Set.empty
-  threadTerminationQSem <- newQSem 0
+  threadTerminationMSem <- MSem.new 0
   let state = HTTPState {
                 httpStateAccessLogMaybeHandleMVar = accessLogMaybeHandleMVar,
                 httpStateErrorLogMaybeHandleMVar = errorLogMaybeHandleMVar,
                 httpStateForkPrimitive = forkPrimitive,
                 httpStateThreadSetMVar = threadSetMVar,
-                httpStateThreadTerminationQSem = threadTerminationQSem,
+                httpStateThreadTerminationMSem = threadTerminationMSem,
                 httpStateMaybeConnection = Nothing
               }
   if serverParametersDaemonize parameters
@@ -457,12 +459,12 @@ acceptLoop parameters handler = do
         threadWaitLoop = do
           state <- getHTTPState
           let mvar = httpStateThreadSetMVar state
-              qsem = httpStateThreadTerminationQSem state
+              msem = httpStateThreadTerminationMSem state
           threadSet <- readMVar mvar
           if Set.null threadSet
             then liftBase exitSuccess
             else do
-              waitQSem qsem
+              liftBase $ MSem.wait msem
               threadWaitLoop
 
 
