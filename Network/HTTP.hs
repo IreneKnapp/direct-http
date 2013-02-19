@@ -291,16 +291,22 @@ httpFork action = do
   let mvar = httpStateThreadSetMVar state
       msem = httpStateThreadTerminationMSem state
   threadSet <- takeMVar mvar
-  childThread <- liftBaseDiscard (httpStateForkPrimitive state)
-    $ finally action
-              (do
-                threadSet <- takeMVar mvar
-                self <- myThreadId
-                let threadSet' = Set.delete self threadSet'
-                putMVar mvar threadSet'
-                liftBase $ MSem.signal msem)
+  childThread <- liftBaseDiscard (httpStateForkPrimitive state) $ do
+    httpLog $ "Child reporting!"
+    finally (do
+              httpLog $ "Child inside 'finally'."
+              action
+              httpLog $ "Child done.")
+            (do
+              httpLog $ "Child cleaning up."
+              threadSet <- takeMVar mvar
+              self <- myThreadId
+              let threadSet' = Set.delete self threadSet'
+              putMVar mvar threadSet'
+              liftBase $ MSem.signal msem)
   let threadSet' = Set.insert childThread threadSet
   putMVar mvar threadSet'
+  httpLog $ "Parent reporting."
   return childThread
 
 
@@ -399,42 +405,6 @@ acceptLoop
     -> IO ()
     -- ^ Never actually returns.
 acceptLoop parameters handler = do
-  (listenSockets, accessLogMaybeHandle, errorLogMaybeHandle)
-    <- catch
-       (do
-         listenSockets <-
-           mapM createListenSocket (serverParametersListenSockets parameters)
-         accessLogMaybeHandle
-           <- case serverParametersAccessLogPath parameters of
-                Nothing -> return Nothing
-                Just path -> openBinaryFile path AppendMode
-                             >>= return . Just
-         errorLogMaybeHandle
-           <- case serverParametersErrorLogPath parameters of
-                Nothing -> if serverParametersDaemonize parameters
-                             then return Nothing
-                             else return $ Just stdout
-                Just path -> openBinaryFile path AppendMode
-                             >>= return . Just
-         return (listenSockets, accessLogMaybeHandle, errorLogMaybeHandle))
-        (\e -> do
-           hPutStrLn stderr
-                     $ "Failed to start: "
-                       ++ (show (e :: SomeException))
-           exitFailure)
-  accessLogMaybeHandleMVar <- newMVar accessLogMaybeHandle
-  errorLogMaybeHandleMVar <- newMVar errorLogMaybeHandle
-  let forkPrimitive = serverParametersForkPrimitive parameters
-  threadSetMVar <- newMVar Set.empty
-  threadTerminationMSem <- MSem.new 0
-  let state = HTTPState {
-                httpStateAccessLogMaybeHandleMVar = accessLogMaybeHandleMVar,
-                httpStateErrorLogMaybeHandleMVar = errorLogMaybeHandleMVar,
-                httpStateForkPrimitive = forkPrimitive,
-                httpStateThreadSetMVar = threadSetMVar,
-                httpStateThreadTerminationMSem = threadTerminationMSem,
-                httpStateMaybeConnection = Nothing
-              }
   if serverParametersDaemonize parameters
     then daemonize (defaultDaemonOptions {
                         daemonUserToChangeTo =
@@ -442,28 +412,82 @@ acceptLoop parameters handler = do
                         daemonGroupToChangeTo =
                           serverParametersGroupToChangeTo parameters
                       })
-                   $ acceptLoop' state listenSockets
-    else acceptLoop' state listenSockets
-  where acceptLoop' state listenSockets = do
-          let acceptLoop'' :: Network.Socket -> HTTP ()
-              acceptLoop'' listenSocket = do
-                (socket, peer) <- liftBase $ Network.accept listenSocket
-                httpFork $ requestLoop socket peer handler
-                acceptLoop'' listenSocket
+                   (initialize)
+                   (\bootstrap -> acceptLoop' bootstrap)
+    else do
+      bootstrap <- initialize
+      acceptLoop' bootstrap
+  where initialize = do
+          accessLogMaybeHandle
+            <- case serverParametersAccessLogPath parameters of
+                 Nothing -> return Nothing
+                 Just path -> liftBase $ openBinaryFile path AppendMode
+                              >>= return . Just
+          errorLogMaybeHandle
+            <- case serverParametersErrorLogPath parameters of
+                 Nothing -> if serverParametersDaemonize parameters
+                              then return Nothing
+                              else return $ Just stdout
+                 Just path -> liftBase $ openBinaryFile path AppendMode
+                              >>= return . Just
+          listenSockets <-
+            catch (mapM createListenSocket
+                        (serverParametersListenSockets parameters))
+                  (\e -> do
+                     case errorLogMaybeHandle of
+                       Nothing -> return ()
+                       Just errorLogHandle -> do
+                         hPutStrLn errorLogHandle $
+                          "Failed to start: " ++ (show (e :: SomeException))
+                     liftBase $ exitFailure)
+          return (listenSockets, accessLogMaybeHandle, errorLogMaybeHandle)
+        acceptLoop' (listenSockets,
+                     accessLogMaybeHandle,
+                     errorLogMaybeHandle) = do
+          accessLogMaybeHandleMVar <- newMVar accessLogMaybeHandle
+          errorLogMaybeHandleMVar <- newMVar errorLogMaybeHandle
+          let forkPrimitive = serverParametersForkPrimitive parameters
+          threadSetMVar <- newMVar Set.empty
+          threadTerminationMSem <- MSem.new 0
+          let state = HTTPState {
+                        httpStateAccessLogMaybeHandleMVar =
+                          accessLogMaybeHandleMVar,
+                        httpStateErrorLogMaybeHandleMVar =
+                          errorLogMaybeHandleMVar,
+                        httpStateForkPrimitive = forkPrimitive,
+                        httpStateThreadSetMVar = threadSetMVar,
+                        httpStateThreadTerminationMSem = threadTerminationMSem,
+                        httpStateMaybeConnection = Nothing
+                      }
           flip runReaderT state $ do
             httpLog $ "Server started."
             threadIDs <-
               mapM (\listenSocket -> httpFork $ acceptLoop'' listenSocket)
                    listenSockets
             threadWaitLoop
+        acceptLoop'' :: Network.Socket -> HTTP ()
+        acceptLoop'' listenSocket = do
+          httpLog $ "Accept loop."
+          (socket, peer) <- catch
+            (liftBase $ Network.accept listenSocket)
+            (\e -> do
+               httpLog $ "Huh..." ++ (show (e :: SomeException))
+               liftBase $ exitFailure)
+          httpLog $ "Accept loop got connection."
+          httpFork $ requestLoop socket peer handler
+          acceptLoop'' listenSocket
         threadWaitLoop = do
+          httpLog $ "Thread-wait loop..."
           state <- getHTTPState
           let mvar = httpStateThreadSetMVar state
               msem = httpStateThreadTerminationMSem state
           threadSet <- readMVar mvar
           if Set.null threadSet
-            then liftBase exitSuccess
+            then do
+              httpLog $ "Server stopped."
+              liftBase exitSuccess
             else do
+              httpLog $ "Waiting on semaphore..."
               liftBase $ MSem.wait msem
               threadWaitLoop
 
@@ -477,11 +501,11 @@ createListenSocket parameters = do
           Network.SockAddrInet _ _ -> Network.AF_INET
           Network.SockAddrInet6 _ _ _ _ -> Network.AF_INET6
           Network.SockAddrUnix _ -> Network.AF_UNIX
-  listenSocket <- Network.socket addressFamily
-                                 Network.Stream
-                                 Network.defaultProtocol
-  Network.bindSocket listenSocket address
-  Network.listen listenSocket 1024
+  listenSocket <- liftBase $ Network.socket addressFamily
+                                            Network.Stream
+                                            Network.defaultProtocol
+  liftBase $ Network.bind listenSocket address
+  liftBase $ Network.listen listenSocket 1024
   return listenSocket
 
 

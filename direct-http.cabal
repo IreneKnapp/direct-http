@@ -1,5 +1,5 @@
 name: direct-http
-version: 0.5.1
+version: 0.5.2
 cabal-version: >= 1.10
 build-type: Simple
 license: BSD3
@@ -22,6 +22,10 @@ description:
   to it, and makes several design decisions differently.  The biggest is the
   use of MonadControlBase for exceptions.
   .
+  Version 0.5.2: Actually works with daemonization, by using a feature of
+  direct-daemon added for this purpose to open the socket after forking but
+  before dropping privileges.
+  .
   Version 0.5.1: Uses SafeSemaphore, which is the future, rather than QSem
   from base, which is deprecated.
   .
@@ -42,7 +46,7 @@ Library
                  time >= 1.4 && < 2,
                  old-locale >= 1.0.0.4 && < 2,
                  unix >= 2.5.1.0 && < 3,
-                 direct-daemonize >= 3.0 && < 4,
+                 direct-daemonize >= 3.1 && < 4,
                  transformers-base >= 0.4.1 && < 1,
                  lifted-base >= 0.1.1 && < 2,
                  monad-control >= 0.3.1.3 && < 1,
