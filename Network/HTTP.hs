@@ -291,22 +291,16 @@ httpFork action = do
   let mvar = httpStateThreadSetMVar state
       msem = httpStateThreadTerminationMSem state
   threadSet <- takeMVar mvar
-  childThread <- liftBaseDiscard (httpStateForkPrimitive state) $ do
-    httpLog $ "Child reporting!"
-    finally (do
-              httpLog $ "Child inside 'finally'."
-              action
-              httpLog $ "Child done.")
-            (do
-              httpLog $ "Child cleaning up."
-              threadSet <- takeMVar mvar
-              self <- myThreadId
-              let threadSet' = Set.delete self threadSet'
-              putMVar mvar threadSet'
-              liftBase $ MSem.signal msem)
+  childThread <- liftBaseDiscard (httpStateForkPrimitive state)
+    $ finally action
+              (do
+                threadSet <- takeMVar mvar
+                self <- myThreadId
+                let threadSet' = Set.delete self threadSet'
+                putMVar mvar threadSet'
+                liftBase $ MSem.signal msem)
   let threadSet' = Set.insert childThread threadSet
   putMVar mvar threadSet'
-  httpLog $ "Parent reporting."
   return childThread
 
 
@@ -467,27 +461,17 @@ acceptLoop parameters handler = do
             threadWaitLoop
         acceptLoop'' :: Network.Socket -> HTTP ()
         acceptLoop'' listenSocket = do
-          httpLog $ "Accept loop."
-          (socket, peer) <- catch
-            (liftBase $ Network.accept listenSocket)
-            (\e -> do
-               httpLog $ "Huh..." ++ (show (e :: SomeException))
-               liftBase $ exitFailure)
-          httpLog $ "Accept loop got connection."
+          (socket, peer) <- liftBase $ Network.accept listenSocket
           httpFork $ requestLoop socket peer handler
           acceptLoop'' listenSocket
         threadWaitLoop = do
-          httpLog $ "Thread-wait loop..."
           state <- getHTTPState
           let mvar = httpStateThreadSetMVar state
               msem = httpStateThreadTerminationMSem state
           threadSet <- readMVar mvar
           if Set.null threadSet
-            then do
-              httpLog $ "Server stopped."
-              liftBase exitSuccess
+            then liftBase exitSuccess
             else do
-              httpLog $ "Waiting on semaphore..."
               liftBase $ MSem.wait msem
               threadWaitLoop
 
