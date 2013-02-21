@@ -216,6 +216,7 @@ data ResponseContentParameters
   | ResponseContentBufferedIdentity
   | ResponseContentUnbufferedIdentity Int
   | ResponseContentChunked
+  deriving (Show)
 
 
 -- | An object representing a cookie (a small piece of information, mostly
@@ -290,18 +291,18 @@ httpFork action = do
   state <- getHTTPState
   let mvar = httpStateThreadSetMVar state
       msem = httpStateThreadTerminationMSem state
-  threadSet <- takeMVar mvar
-  childThread <- liftBaseDiscard (httpStateForkPrimitive state)
-    $ finally action
-              (do
-                threadSet <- takeMVar mvar
-                self <- myThreadId
-                let threadSet' = Set.delete self threadSet'
-                putMVar mvar threadSet'
-                liftBase $ MSem.signal msem)
-  let threadSet' = Set.insert childThread threadSet
-  putMVar mvar threadSet'
-  return childThread
+  withMVar mvar $ \threadSet -> do
+    childThread <- liftBaseDiscard (httpStateForkPrimitive state)
+      $ finally action
+                (do
+                  withMVar mvar $ \threadSet -> do
+                    self <- myThreadId
+                    let threadSet' = Set.delete self threadSet'
+                    putMVar mvar threadSet'
+                    liftBase $ MSem.signal msem)
+    let threadSet' = Set.insert childThread threadSet
+    putMVar mvar threadSet'
+    return childThread
 
 
 -- | A record used to configure the server.  Broken informally into the four
@@ -606,8 +607,15 @@ requestLoop socket peer handler = do
                    else setResponseStatus 500)
             logAccess
             isWritable <- httpIsWritable
+            httpLog $ "Writable: " ++ show isWritable
             if isWritable
-              then httpCloseOutput
+              then do
+                connection <- getHTTPConnection
+                let parametersMVar =
+                      httpConnectionResponseContentParameters connection
+                parameters <- readMVar parametersMVar
+                httpLog $ show parameters
+                httpCloseOutput
               else return ()
             connectionShouldStayAlive <- getConnectionShouldStayAlive
             if connectionShouldStayAlive
@@ -902,57 +910,57 @@ recvHeaders :: (MonadHTTP m)
 recvHeaders = do
   HTTPConnection { httpConnectionInputBufferMVar = inputBufferMVar }
     <- getHTTPConnection
-  inputBuffer <- takeMVar inputBufferMVar
-  (inputBuffer, maybeLine) <- recvLine inputBuffer
-  (inputBuffer, result) <- case maybeLine of
-    Nothing -> return (inputBuffer, Nothing)
-    Just line -> do
-      let computeWords input =
-            let (before, after) = BS.breakSubstring (UTF8.fromString " ") input
-            in if BS.null after
-              then [before]
-              else let rest = computeWords $ BS.drop 1 after
-                   in before : rest
-          words = computeWords line
-      case words of
-        [method, url, protocol]
-          | (isValidMethod method)
-            && (isValidURL url)
-            && (isValidProtocol protocol)
-          -> do
-            let loop inputBuffer headersSoFar = do
-                  (inputBuffer, maybeLine) <- recvLine inputBuffer
-                  case maybeLine of
-                    Nothing -> return (inputBuffer, Nothing)
-                    Just line
-                      | BS.null line -> do
-                          return (inputBuffer,
-                                  Just (method, url, protocol, headersSoFar))
-                      | otherwise -> do
-                          case parseHeader line of
-                            Nothing -> do
-                              logInvalidRequest
-                              return (inputBuffer, Nothing)
-                            Just (header, value) -> do
-                              let headersSoFar'
-                                   = case Map.lookup header headersSoFar of
-                                       Nothing -> Map.insert header
-                                                             value
-                                                             headersSoFar
-                                       Just oldValue
-                                         -> Map.insert
-                                            header
-                                            (BS.concat [oldValue,
-                                                        (UTF8.fromString ","),
-                                                        value])
-                                            headersSoFar
-                              loop inputBuffer headersSoFar'
-            loop inputBuffer Map.empty
-        _ -> do
-          logInvalidRequest
-          return (inputBuffer, Nothing)
-  putMVar inputBufferMVar inputBuffer
-  return result
+  withMVar inputBufferMVar $ \inputBuffer -> do
+    (inputBuffer, maybeLine) <- recvLine inputBuffer
+    (inputBuffer, result) <- case maybeLine of
+      Nothing -> return (inputBuffer, Nothing)
+      Just line -> do
+        let computeWords input =
+              let (before, after) = BS.breakSubstring (UTF8.fromString " ") input
+              in if BS.null after
+                then [before]
+                else let rest = computeWords $ BS.drop 1 after
+                     in before : rest
+            words = computeWords line
+        case words of
+          [method, url, protocol]
+            | (isValidMethod method)
+              && (isValidURL url)
+              && (isValidProtocol protocol)
+            -> do
+              let loop inputBuffer headersSoFar = do
+                    (inputBuffer, maybeLine) <- recvLine inputBuffer
+                    case maybeLine of
+                      Nothing -> return (inputBuffer, Nothing)
+                      Just line
+                        | BS.null line -> do
+                            return (inputBuffer,
+                                    Just (method, url, protocol, headersSoFar))
+                        | otherwise -> do
+                            case parseHeader line of
+                              Nothing -> do
+                                logInvalidRequest
+                                return (inputBuffer, Nothing)
+                              Just (header, value) -> do
+                                let headersSoFar'
+                                     = case Map.lookup header headersSoFar of
+                                         Nothing -> Map.insert header
+                                                               value
+                                                               headersSoFar
+                                         Just oldValue
+                                           -> Map.insert
+                                              header
+                                              (BS.concat [oldValue,
+                                                          (UTF8.fromString ","),
+                                                          value])
+                                              headersSoFar
+                                loop inputBuffer headersSoFar'
+              loop inputBuffer Map.empty
+          _ -> do
+            logInvalidRequest
+            return (inputBuffer, Nothing)
+    putMVar inputBufferMVar inputBuffer
+    return result
 
 
 parseHeader :: ByteString -> Maybe (Header, ByteString)
@@ -1016,13 +1024,13 @@ recvLine inputBuffer = do
 
 recvBlock :: (MonadHTTP m) => Int -> m ByteString
 recvBlock length = do
-  HTTPConnection { httpConnectionInputBufferMVar = inputBufferMVar } <- getHTTPConnection
-  inputBuffer <- takeMVar inputBufferMVar
-  (inputBuffer, endOfInput)
-    <- extendInputBuffer inputBuffer length True
-  (result, inputBuffer) <- return $ BS.splitAt length inputBuffer
-  putMVar inputBufferMVar inputBuffer
-  return result
+  HTTPConnection { httpConnectionInputBufferMVar = inputBufferMVar } <-
+    getHTTPConnection
+  withMVar inputBufferMVar $ \inputBuffer -> do
+    (inputBuffer, endOfInput) <- extendInputBuffer inputBuffer length True
+    (result, inputBuffer) <- return $ BS.splitAt length inputBuffer
+    putMVar inputBufferMVar inputBuffer
+    return result
 
 
 extendInputBuffer :: (MonadHTTP m)
@@ -1404,21 +1412,21 @@ getRequestCookieMap :: (MonadHTTP m) => m (Map String Cookie)
 getRequestCookieMap = do
   connection <- getHTTPConnection
   let mvar = httpConnectionRequestCookieMap connection
-  maybeCookieMap <- takeMVar mvar
-  case maybeCookieMap of
-    Just cookieMap -> do
-      putMVar mvar maybeCookieMap
-      return cookieMap
-    Nothing -> do
-      maybeCookieString <- getRequestHeader HttpCookie
-      let cookieMap =
-            case maybeCookieString of
-              Nothing -> Map.empty
-              Just cookieString ->
-                Map.fromList (map (\cookie -> (cookieName cookie, cookie))
-                                  (parseCookies cookieString))
-      putMVar mvar (Just cookieMap)
-      return cookieMap
+  withMVar mvar $ \maybeCookieMap -> do
+    case maybeCookieMap of
+      Just cookieMap -> do
+        putMVar mvar maybeCookieMap
+        return cookieMap
+      Nothing -> do
+        maybeCookieString <- getRequestHeader HttpCookie
+        let cookieMap =
+              case maybeCookieString of
+                Nothing -> Map.empty
+                Just cookieString ->
+                  Map.fromList (map (\cookie -> (cookieName cookie, cookie))
+                                    (parseCookies cookieString))
+        putMVar mvar (Just cookieMap)
+        return cookieMap
 
 
 -- | Return the remote address, which includes both host and port information.
@@ -1511,12 +1519,12 @@ getRequestHasContent :: (MonadHTTP m) => m Bool
 getRequestHasContent = do
   HTTPConnection { httpConnectionRequestContentParameters = parametersMVar }
     <- getHTTPConnection
-  parameters <- takeMVar parametersMVar
-  parameters <- ensureRequestContentParametersInitialized parameters
-  putMVar parametersMVar parameters
-  return $ case parameters of
-    RequestContentNone -> False
-    _ -> True
+  withMVar parametersMVar $ \parameters -> do
+    parameters <- ensureRequestContentParametersInitialized parameters
+    putMVar parametersMVar parameters
+    return $ case parameters of
+      RequestContentNone -> False
+      _ -> True
 
 
 getRequestContentAllowed :: (MonadHTTP m) => m Bool
@@ -1567,13 +1575,13 @@ httpIsReadable :: (MonadHTTP m) => m Bool
 httpIsReadable = do
   HTTPConnection { httpConnectionRequestContentParameters = parametersMVar }
     <- getHTTPConnection
-  parameters <- takeMVar parametersMVar
-  parameters <- ensureRequestContentParametersInitialized parameters
-  putMVar parametersMVar parameters
-  return $ case parameters of
-             RequestContentNone -> False
-             RequestContentClosed -> False
-             _ -> True
+  withMVar parametersMVar $ \parameters -> do
+    parameters <- ensureRequestContentParametersInitialized parameters
+    putMVar parametersMVar parameters
+    return $ case parameters of
+               RequestContentNone -> False
+               RequestContentClosed -> False
+               _ -> True
 
 
 httpGet' :: (MonadHTTP m) => (Maybe Int) -> Bool -> Bool -> m BS.ByteString
@@ -1585,17 +1593,17 @@ httpGet' maybeSize blocking discarding = do
       httpConnectionRequestContentBuffer = bufferMVar,
       httpConnectionRequestContentParameters = parametersMVar
     } <- getHTTPConnection
-  buffer <- takeMVar bufferMVar
-  parameters <- takeMVar parametersMVar
-  parameters <- ensureRequestContentParametersInitialized parameters
-  (buffer, parameters)
-    <- extendRequestContentBuffer buffer parameters maybeSize blocking
-  (result, buffer) <- return $ case maybeSize of
-                        Nothing -> (buffer, BS.empty)
-                        Just size -> BS.splitAt size buffer
-  putMVar parametersMVar parameters
-  putMVar bufferMVar buffer
-  return result
+  withMVar bufferMVar $ \buffer -> do
+    withMVar parametersMVar $ \parameters -> do
+      parameters <- ensureRequestContentParametersInitialized parameters
+      (buffer, parameters)
+        <- extendRequestContentBuffer buffer parameters maybeSize blocking
+      (result, buffer) <- return $ case maybeSize of
+                            Nothing -> (buffer, BS.empty)
+                            Just size -> BS.splitAt size buffer
+      putMVar parametersMVar parameters
+      putMVar bufferMVar buffer
+      return result
 
 
 ensureRequestContentParametersInitialized
@@ -1673,11 +1681,11 @@ extendRequestContentBuffer highLevelBuffer
                  -- TODO IAK
   HTTPConnection { httpConnectionInputBufferMVar = lowLevelBufferMVar }
     <- getHTTPConnection
-  lowLevelBuffer <- takeMVar lowLevelBufferMVar
-  (highLevelBuffer, lowLevelBuffer, parameters)
-    <- loop highLevelBuffer lowLevelBuffer parameters
-  putMVar lowLevelBufferMVar lowLevelBuffer
-  return (highLevelBuffer, parameters)
+  withMVar lowLevelBufferMVar $ \lowLevelBuffer -> do
+    (highLevelBuffer, lowLevelBuffer, parameters)
+      <- loop highLevelBuffer lowLevelBuffer parameters
+    putMVar lowLevelBufferMVar lowLevelBuffer
+    return (highLevelBuffer, parameters)
 
 
 -- | Sets the response status which will be sent with the response headers.  If
@@ -1738,9 +1746,9 @@ setResponseHeader' header value = do
     then do
       connection <- getHTTPConnection
       let mvar = httpConnectionResponseHeaderMap connection
-      headerMap <- takeMVar mvar
-      let headerMap' = Map.insert header (UTF8.fromString value) headerMap
-      putMVar mvar headerMap'
+      withMVar mvar $ \headerMap -> do
+        let headerMap' = Map.insert header (UTF8.fromString value) headerMap
+        putMVar mvar headerMap'
     else throwIO $ NotAResponseHeader header
 
 
@@ -1765,9 +1773,9 @@ unsetResponseHeader header = do
   if isValidInResponse header
     then do
       HTTPConnection { httpConnectionResponseHeaderMap = mvar } <- getHTTPConnection
-      headerMap <- takeMVar mvar
-      headerMap <- return $ Map.delete header headerMap
-      putMVar mvar headerMap
+      withMVar mvar $ \headerMap -> do
+        headerMap <- return $ Map.delete header headerMap
+        putMVar mvar headerMap
     else throwIO $ NotAResponseHeader header
 
 
@@ -1809,10 +1817,10 @@ setCookie cookie = do
   requireValidCookieName $ cookieName cookie
   connection <- getHTTPConnection
   let mvar = httpConnectionResponseCookieMap connection
-  responseCookieMap <- takeMVar mvar
-  let responseCookieMap' =
-        Map.insert (cookieName cookie) cookie responseCookieMap
-  putMVar mvar responseCookieMap'
+  withMVar mvar $ \responseCookieMap -> do
+    let responseCookieMap' =
+          Map.insert (cookieName cookie) cookie responseCookieMap
+    putMVar mvar responseCookieMap'
 
 
 -- | Causes the user agent to unset any cookie applicable to this page with the
@@ -1834,10 +1842,10 @@ unsetCookie name = do
   requireValidCookieName name
   connection <- getHTTPConnection
   let mvar = httpConnectionResponseCookieMap connection
-  responseCookieMap <- takeMVar mvar
-  let responseCookieMap' =
-        Map.insert name (mkUnsetCookie name) responseCookieMap
-  putMVar mvar responseCookieMap'
+  withMVar mvar $ \responseCookieMap -> do
+    let responseCookieMap' =
+          Map.insert name (mkUnsetCookie name) responseCookieMap
+    putMVar mvar responseCookieMap'
 
 
 -- | Constructs a cookie with the given name and value.  Version is set to 1;
@@ -1988,22 +1996,24 @@ sendResponseHeaders = do
       modifiableMVar = httpConnectionResponseHeadersModifiable connection
       parametersMVar = httpConnectionResponseContentParameters connection
       bufferMVar = httpConnectionResponseContentBuffer connection
-  parameters <- takeMVar parametersMVar
-  parameters <- ensureResponseContentParametersInitialized parameters
-  putMVar parametersMVar parameters
-  alreadySent <- takeMVar alreadySentMVar
-  if not alreadySent
-    then do
-      _ <- swapMVar modifiableMVar False
-      case parameters of
-        ResponseContentBufferedIdentity -> do
-          buffer <- readMVar bufferMVar
-          setResponseHeader' HttpContentLength (show $ BS.length buffer)
-        _ -> do
-          headersBuffer <- getHeadersBuffer
-          send headersBuffer
-    else return ()
-  putMVar alreadySentMVar True
+  parameters <-
+    withMVar parametersMVar $ \parameters -> do
+      parameters <- ensureResponseContentParametersInitialized parameters
+      putMVar parametersMVar parameters
+      return parameters
+  withMVar alreadySentMVar $ \alreadySent -> do
+    if not alreadySent
+      then do
+        _ <- swapMVar modifiableMVar False
+        case parameters of
+          ResponseContentBufferedIdentity -> do
+            buffer <- readMVar bufferMVar
+            setResponseHeader' HttpContentLength (show $ BS.length buffer)
+          _ -> do
+            headersBuffer <- getHeadersBuffer
+            send headersBuffer
+      else return ()
+    putMVar alreadySentMVar True
 
 
 getHeadersBuffer :: (MonadHTTP m) => m ByteString
@@ -2161,50 +2171,62 @@ httpPut bytestring = do
   let bufferMVar = httpConnectionResponseContentBuffer connection
       parametersMVar = httpConnectionResponseContentParameters connection
       alreadySentMVar = httpConnectionResponseHeadersSent connection
-  buffer <- takeMVar bufferMVar
-  parameters <- takeMVar parametersMVar
-  parameters <- ensureResponseContentParametersInitialized parameters
-  (buffer, parameters) <- case parameters of
-    ResponseContentClosed -> throwIO OutputAlreadyClosed
-    ResponseContentBufferedIdentity -> do
-      return (BS.append buffer bytestring, ResponseContentBufferedIdentity)
-    ResponseContentUnbufferedIdentity lengthRemaining -> do
-      alreadySent <- takeMVar alreadySentMVar
-      if alreadySent
-        then return ()
-        else do
-          headersBuffer <- getHeadersBuffer
-          send headersBuffer
-      putMVar alreadySentMVar True
-      let lengthThisPut = BS.length bytestring
-      if lengthThisPut > lengthRemaining
-        then do
-          putMVar parametersMVar ResponseContentClosed
-          putMVar bufferMVar BS.empty
-          throwIO OutputAlreadyClosed
-        else do
-          let parameters' = ResponseContentUnbufferedIdentity
-                             $ lengthRemaining - lengthThisPut
-          send bytestring
-          return (buffer, parameters')
-    ResponseContentChunked -> do
-      alreadySent <- takeMVar alreadySentMVar
-      if alreadySent
-        then return ()
-        else do
-          headersBuffer <- getHeadersBuffer
-          send headersBuffer
-      putMVar alreadySentMVar True
-      if BS.length bytestring > 0
-        then do
-          let lengthBuffer =
-                UTF8.fromString $ showHex (BS.length bytestring) "" ++ "\r\n"
-              crlfBuffer = UTF8.fromString "\r\n"
-          send $ BS.concat [lengthBuffer, bytestring, crlfBuffer]
-        else return ()
-      return (buffer, parameters)
-  putMVar parametersMVar parameters
-  putMVar bufferMVar buffer
+  maybeException <- do
+    withMVar bufferMVar $ \buffer -> do
+      withMVar parametersMVar $ \parameters -> do
+        parameters <- ensureResponseContentParametersInitialized parameters
+        case parameters of
+          ResponseContentClosed -> do
+            putMVar parametersMVar parameters
+            putMVar bufferMVar buffer
+            return $ Just OutputAlreadyClosed
+          ResponseContentBufferedIdentity -> do
+            putMVar parametersMVar $ ResponseContentBufferedIdentity
+            putMVar bufferMVar $ BS.append buffer bytestring
+            return Nothing
+          ResponseContentUnbufferedIdentity lengthRemaining -> do
+            withMVar alreadySentMVar $ \alreadySent -> do
+              if alreadySent
+                then return ()
+                else do
+                  headersBuffer <- getHeadersBuffer
+                  send headersBuffer
+              putMVar alreadySentMVar True
+            let lengthThisPut = BS.length bytestring
+            if lengthThisPut > lengthRemaining
+              then do
+                putMVar parametersMVar ResponseContentClosed
+                putMVar bufferMVar BS.empty
+                return $ Just OutputAlreadyClosed
+              else do
+                let parameters' = ResponseContentUnbufferedIdentity
+                                   $ lengthRemaining - lengthThisPut
+                send bytestring
+                putMVar parametersMVar parameters'
+                putMVar bufferMVar buffer
+                return Nothing
+          ResponseContentChunked -> do
+            withMVar alreadySentMVar $ \alreadySent -> do
+              if alreadySent
+                then return ()
+                else do
+                  headersBuffer <- getHeadersBuffer
+                  send headersBuffer
+              putMVar alreadySentMVar True
+            if BS.length bytestring > 0
+              then do
+                let lengthBuffer =
+                      UTF8.fromString $ showHex (BS.length bytestring) ""
+                                        ++ "\r\n"
+                    crlfBuffer = UTF8.fromString "\r\n"
+                send $ BS.concat [lengthBuffer, bytestring, crlfBuffer]
+              else return ()
+            putMVar parametersMVar parameters
+            putMVar bufferMVar buffer
+            return Nothing
+  case maybeException of
+    Nothing -> return ()
+    Just exception -> throwIO exception
 
 
 ensureResponseContentParametersInitialized
@@ -2241,29 +2263,37 @@ flushResponseContent = do
   connection <- getHTTPConnection
   let bufferMVar = httpConnectionResponseContentBuffer connection
       parametersMVar = httpConnectionResponseContentParameters connection
-  buffer <- takeMVar bufferMVar
-  parameters <- takeMVar parametersMVar
-  parameters <- ensureResponseContentParametersInitialized parameters
-  case parameters of
-    ResponseContentClosed -> throwIO OutputAlreadyClosed
-    ResponseContentBufferedIdentity -> do
-      headersBuffer <- getHeadersBuffer
-      send $ BS.concat [headersBuffer, buffer]
-      return ()
-    ResponseContentUnbufferedIdentity lengthRemaining -> do
-      if lengthRemaining > 0
-        then do
-          putMVar parametersMVar ResponseContentClosed
-          putMVar bufferMVar BS.empty
-          throwIO OutputIncomplete
-        else return ()
-    ResponseContentChunked -> do
-      let emptyChunkBuffer = UTF8.fromString $ "0\r\n\r\n\r\n"
-      send emptyChunkBuffer
-      putMVar parametersMVar parameters
-      putMVar bufferMVar buffer
-  putMVar parametersMVar ResponseContentClosed
-  putMVar bufferMVar BS.empty
+  maybeException <-
+    withMVar bufferMVar $ \buffer -> do
+      withMVar parametersMVar $ \parameters -> do
+        parameters <- ensureResponseContentParametersInitialized parameters
+        case parameters of
+          ResponseContentClosed -> do
+            putMVar parametersMVar ResponseContentClosed
+            putMVar bufferMVar BS.empty
+            return $ Just OutputAlreadyClosed
+          ResponseContentBufferedIdentity -> do
+            headersBuffer <- getHeadersBuffer
+            send $ BS.concat [headersBuffer, buffer]
+            putMVar parametersMVar ResponseContentClosed
+            putMVar bufferMVar BS.empty
+            return Nothing
+          ResponseContentUnbufferedIdentity lengthRemaining -> do
+            if lengthRemaining > 0
+              then do
+                putMVar parametersMVar ResponseContentClosed
+                putMVar bufferMVar BS.empty
+                return $ Just OutputIncomplete
+              else return Nothing
+          ResponseContentChunked -> do
+            let emptyChunkBuffer = UTF8.fromString $ "0\r\n\r\n\r\n"
+            send emptyChunkBuffer
+            putMVar parametersMVar ResponseContentClosed
+            putMVar bufferMVar BS.empty
+            return Nothing
+  case maybeException of
+    Nothing -> return ()
+    Just exception -> throwIO exception
 
 
 send :: (MonadHTTP m) => ByteString -> m ()
@@ -2304,12 +2334,12 @@ httpIsWritable :: (MonadHTTP m) => m Bool
 httpIsWritable = do
   connection <- getHTTPConnection
   let parametersMVar = httpConnectionResponseContentParameters connection
-  parameters <- takeMVar parametersMVar
-  parameters <- ensureResponseContentParametersInitialized parameters
-  putMVar parametersMVar parameters
-  return $ case parameters of
-             ResponseContentClosed -> False
-             _ -> True
+  withMVar parametersMVar $ \parameters -> do
+    parameters <- ensureResponseContentParametersInitialized parameters
+    putMVar parametersMVar parameters
+    return $ case parameters of
+               ResponseContentClosed -> False
+               _ -> True
 
 
 requireResponseHeadersNotYetSent :: (MonadHTTP m) => m ()
