@@ -641,13 +641,31 @@ getRequestValid = do
   let getHeadersValid = do
         connection <- getHTTPConnection
         headerMap <- readMVar $ httpConnectionRequestHeaderMap connection
-        return $ all (\header -> (isValidInRequest header)
-                                 && (hasContent
-                                     || (not $ isValidOnlyWithEntity header)))
-                     $ Map.keys headerMap
+        foldM (\result header -> do
+                 if isValidInRequest header
+                   then return result
+                   else do
+                     if hasContent
+                       then return result
+                       else if not $ isValidOnlyWithEntity header
+                         then return result
+                         else do
+                           httpLog $ "Header " ++ (show header)
+                                     ++ " is valid only with an entity."
+                           return False)
+              True
+              (Map.keys headerMap)
       getContentValid = do
         contentAllowed <- getRequestContentAllowed
-        return $ contentAllowed || not hasContent
+        if contentAllowed
+          then return True
+          else if not hasContent
+            then return True
+            else do
+              method <- getRequestMethod
+              httpLog $ "Content provided but not allowed with "
+                        ++ method ++ "."
+              return False
   httpVersion <- getRequestProtocol
   case httpVersion of
     "HTTP/1.0" -> do
@@ -660,8 +678,10 @@ getRequestValid = do
       mandatoryHeadersIncluded <- do
         maybeHost <- getRequestHeader HttpHost
         case maybeHost of
-          Nothing -> return False
-          Just host -> return True
+          Just _ -> return True
+          Nothing -> do
+            httpLog $ "Host header not provided and HTTP/1.1 used."
+            return False
       return $ and [headersValid, mandatoryHeadersIncluded, contentValid]
     _ -> return False
 
