@@ -1,5 +1,5 @@
 name: direct-http
-version: 0.5.2
+version: 0.5.3
 cabal-version: >= 1.10
 build-type: Simple
 license: BSD3
@@ -22,14 +22,17 @@ description:
   to it, and makes several design decisions differently.  The biggest is the
   use of MonadControlBase for exceptions.
   .
-  Version 0.5.2: Actually works with daemonization, by using a feature of
+  [Version 0.5.3] Actually works with extension headers, by admitting the
+  reality that they can occur anytime and not just with an entity.
+  .
+  [Version 0.5.2] Actually works with daemonization, by using a feature of
   direct-daemon added for this purpose to open the socket after forking but
   before dropping privileges.
   .
-  Version 0.5.1: Uses SafeSemaphore, which is the future, rather than QSem
+  [Version 0.5.1] Uses SafeSemaphore, which is the future, rather than QSem
   from base, which is deprecated.
   .
-  Version 0.5.0.1: This preliminary release is a preview to gauge community
+  [Version 0.5.0.1] This preliminary release is a preview to gauge community
   interest.  Not even all major features are implemented; things that exist
   only as stubs include encryption, compression, chunking, and reading back
   cookies.  Nonetheless it may be useful if run behind a reverse proxy that
