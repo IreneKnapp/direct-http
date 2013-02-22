@@ -1,5 +1,5 @@
 name: direct-http
-version: 0.5.3
+version: 0.6
 cabal-version: >= 1.10
 build-type: Simple
 license: BSD3
@@ -21,6 +21,9 @@ description:
   author, but is intended more by way of a replacement for it than a companion
   to it, and makes several design decisions differently.  The biggest is the
   use of MonadControlBase for exceptions.
+  .
+  [Version 0.6] Substantial reworking of MVar handling, using safer primitives
+  to be much more robust in the face of exceptions in pure code.
   .
   [Version 0.5.3] Actually works with extension headers, by admitting the
   reality that they can occur anytime and not just with an entity.
