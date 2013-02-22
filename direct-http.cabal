@@ -5,10 +5,10 @@ build-type: Simple
 license: BSD3
 license-file: LICENSE
 copyright: Copyright (c) 2012 Irene Knapp
-author: Irene Knapp
-maintainer: "Irene Knapp" <ireney.knapp@gmail.com>
+author: Irene Knapp <irene.knapp@icloud.com>
+maintainer: irene.knapp@icloud.com
 homepage: http://ireneknapp.com/software/
-bug-reports: http://ireneknapp.com/issues/create/
+bug-reports: https://github.com/IreneKnapp/direct-http/issues/new
 category: Network
 synopsis: Native webserver that acts as a library.
 description:
@@ -43,6 +43,7 @@ description:
 
 Library
   exposed-modules: Network.HTTP
+  hs-source-dirs: Haskell
   build-depends: base >= 4.5 && < 5,
                  bytestring >= 0.9.2.1 && < 1,
                  containers >= 0.4.2.1 && < 1,
